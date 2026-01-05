@@ -30,12 +30,14 @@ export const ingest = onRequest(
     res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
 
     if (req.method === "OPTIONS") {
-      return res.status(204).send("");
+      res.status(204).send("");
+      return;
     }
 
     if (req.method !== "POST") {
       res.set("Allow", "POST");
-      return res.status(405).json({ error: "Method not allowed" });
+      res.status(405).json({ error: "Method not allowed" });
+      return;
     }
 
     const body = (req.body ?? {}) as IngestBody;
@@ -54,9 +56,10 @@ export const ingest = onRequest(
     const tsDate = parseTimestamp(body.ts);
 
     if (!deviceId || lat === undefined || lon === undefined || !tsDate) {
-      return res.status(400).json({
+      res.status(400).json({
         error: "Missing or invalid deviceId, lat, lon, or ts"
       });
+      return;
     }
 
     const ts = Timestamp.fromDate(tsDate);
@@ -93,10 +96,12 @@ export const ingest = onRequest(
       });
 
       logger.info("Ingested point", { deviceId, lat, lon });
-      return res.status(200).json({ status: "ok", deviceId });
+      res.status(200).json({ status: "ok", deviceId });
+      return;
     } catch (err) {
       logger.error("Ingest failure", err);
-      return res.status(500).json({ error: "Failed to ingest point" });
+      res.status(500).json({ error: "Failed to ingest point" });
+      return;
     }
   }
 );

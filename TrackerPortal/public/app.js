@@ -35,6 +35,7 @@ const state = {
 const routes = [
   { pattern: /^\/home$/, handler: renderHome },
   { pattern: /^\/dog\/([^/]+)$/, handler: (_path, id) => renderDog(id) },
+  { pattern: /^\/pet\/([^/]+)$/, handler: (_path, id) => renderPet(id) },
   { pattern: /^\/vehicles$/, handler: () => renderComingSoon("Vehicles") },
   { pattern: /^\/pets$/, handler: () => renderComingSoon("Pets") },
   { pattern: /^\/kids$/, handler: () => renderComingSoon("Kids") }
@@ -202,18 +203,29 @@ function buildDeviceCard(id, data) {
     <p class="muted">Last update: ${lastDate ? formatDate(lastDate) : "—"}</p>
     <div class="actions">
       <div class="pill">ID: ${id}</div>
-      ${
-        typeLabel?.toLowerCase() === "dog"
-          ? `<a class="btn" href="#/dog/${id}" aria-label="Track ${id}">Track dog →</a>`
-          : `<span class="muted">No route</span>`
-      }
+      ${renderTrackLink(id, typeLabel)}
     </div>
   `;
 
   return card;
 }
 
-function renderDog(deviceId) {
+function renderTrackLink(id, typeLabel) {
+  const type = (typeLabel || "").toLowerCase();
+  if (type === "dog") {
+    return `<a class="btn" href="#/dog/${id}" aria-label="Track ${id}">Track dog →</a>`;
+  }
+  if (type === "pet") {
+    return `<a class="btn" href="#/pet/${id}" aria-label="Track ${id}">Track pet →</a>`;
+  }
+  return `<span class="muted">No route</span>`;
+}
+
+function renderPet(deviceId) {
+  renderDog(deviceId, "Pet");
+}
+
+function renderDog(deviceId, label = "Dog") {
   cleanupListeners();
   state.lastDeviceId = deviceId;
 
@@ -221,7 +233,7 @@ function renderDog(deviceId) {
     <div class="section-header">
       <div>
         <a class="back-link" href="#/home">← Back</a>
-        <h2 id="dog-title">Dog tracker</h2>
+        <h2 id="dog-title">${label} tracker</h2>
         <p class="muted">Live location for <span id="dog-id">${deviceId}</span></p>
       </div>
       <span class="pill online" id="dog-status"><span class="dot"></span>Online</span>
@@ -336,7 +348,7 @@ function updateDogUI(deviceId, data) {
 
   if (!title) return;
 
-  title.textContent = data?.name || "Dog tracker";
+  title.textContent = data?.name || "Tracker";
   if (idLabel) idLabel.textContent = deviceId;
 
   const last = data?.last;
