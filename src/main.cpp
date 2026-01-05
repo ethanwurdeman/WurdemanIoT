@@ -2,8 +2,6 @@
 #include <Wire.h>
 #include <cstdio>
 #include <ctime>
-#include <WiFi.h>
-#include <WiFiClientSecure.h>
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -31,8 +29,19 @@ TinyGsm modem(debugger);
 TinyGsm modem(SerialAT);
 #endif
 
-TinyGsmClient netClient(modem);
-WiFiClient wifiClient;
+// Expected successful run (abridged):
+//  - AT response OK
+//  - CPIN: READY
+//  - Network registration OK
+//  - CID0 APN set
+//  - CID0 activated, IP: <ip>
+//  - DNS ok
+//  - Ping ok
+//  - TLS connect ok
+//  - HTTP status: 200/204
+
+TinyGsmClient netClient(modem, 0);
+TinyGsmClientSecure tlsClient(modem, 0);
 XPowersPMU pmu;
 
 struct FixPayload
@@ -70,7 +79,6 @@ constexpr uint32_t HOME_INTERVAL_MS = 5UL * 60UL * 1000UL;
 constexpr uint32_t NEARBY_INTERVAL_MS = 2UL * 60UL * 1000UL;
 constexpr uint32_t ROAM_INTERVAL_MS = 15UL * 1000UL;
 
-bool connectWiFiIfConfigured() { return false; }
 int readBatteryPercent()
 {
     if (!pmu.isBatteryConnect())
@@ -165,14 +173,12 @@ bool sendIngestIfReady()
     const uint16_t port = 443;
     const char *path = "/ingest";
 
-    const bool wifiUp = WiFi.isConnected();
-    Client *client = wifiUp ? static_cast<Client *>(&wifiClient) : static_cast<Client *>(&netClient);
-
-    if (!client->connect(host, port))
+    if (!tlsClient.connect(host, port))
     {
-        SerialMon.println("HTTP connect failed.");
+        SerialMon.println("TLS connect failed.");
         return false;
     }
+    SerialMon.println("TLS connect ok");
 
     const int battPct = readBatteryPercent();
     const bool charging = readChargingStatus();
@@ -195,7 +201,7 @@ bool sendIngestIfReady()
         body += ",\"charging\":";
         body += (charging ? "true" : "false");
         body += ",\"network\":\"";
-        body += (wifiUp ? "wifi" : "cell");
+        body += "cell";
         body += "\"";
         body += ",\"txBytes\":";
         body += String(txBytesVal);
@@ -231,8 +237,8 @@ bool sendIngestIfReady()
     headers = makeHeaders(body.length());
     txLen = headers.length() + body.length();
 
-    client->print(headers);
-    client->print(body);
+    tlsClient.print(headers);
+    tlsClient.print(body);
 
     bool ok = false;
     String status;
@@ -240,13 +246,14 @@ bool sendIngestIfReady()
     unsigned long start = millis();
     while (millis() - start < 10000UL)
     {
-        while (client->available())
+        while (tlsClient.available())
         {
-            char c = client->read();
+            char c = tlsClient.read();
             rxLen++;
             if (c == '\n')
             {
-                if (status.startsWith("HTTP/1.1 200") || status.startsWith("HTTP/1.0 200"))
+                if (status.startsWith("HTTP/1.1 200") || status.startsWith("HTTP/1.0 200") ||
+                    status.startsWith("HTTP/1.1 204") || status.startsWith("HTTP/1.0 204"))
                 {
                     ok = true;
                 }
@@ -257,17 +264,17 @@ bool sendIngestIfReady()
                 status += c;
             }
         }
-        if (!client->connected())
+        if (!tlsClient.connected())
         {
             break;
         }
         delay(10);
     }
-    client->stop();
+    tlsClient.stop();
 
-    SerialMon.printf("Ingest POST status: %s\n", status.c_str());
+    SerialMon.printf("HTTP status: %s\n", status.c_str());
 
-    if (!wifiUp)
+    if (true)
     {
         cellTxBytes += txLen;
         cellRxBytes += rxLen;
@@ -556,9 +563,9 @@ bool waitForCgattState(int target, uint32_t timeoutMs)
     return false;
 }
 
-bool parseCNACT(const String &resp, bool &cid1Active, String &ip)
+bool parseCNACTForCid(const String &resp, int targetCid, bool &cidActive, String &ip)
 {
-    cid1Active = false;
+    cidActive = false;
     ip = "0.0.0.0";
     int search = 0;
     while (true)
@@ -575,18 +582,18 @@ bool parseCNACT(const String &resp, bool &cid1Active, String &ip)
         if (sscanf(line.c_str(), "+CNACT: %d,%d,\"%31[^\"]\"", &cid, &state, ipBuf) == 3 ||
             sscanf(line.c_str(), "+CNACT: %d,%d,%31s", &cid, &state, ipBuf) == 3)
         {
-            if (cid == 1)
+            if (cid == targetCid)
             {
-                cid1Active = (state == 1);
+                cidActive = (state == 1);
                 ip = String(ipBuf);
                 return true;
             }
         }
         else if (sscanf(line.c_str(), "+CNACT: %d,%d", &cid, &state) == 2)
         {
-            if (cid == 1)
+            if (cid == targetCid)
             {
-                cid1Active = (state == 1);
+                cidActive = (state == 1);
                 ip = "0.0.0.0";
                 return true;
             }
@@ -596,109 +603,156 @@ bool parseCNACT(const String &resp, bool &cid1Active, String &ip)
     return false;
 }
 
-bool queryCNACTStatus(bool &cid1Active, String &ip)
+bool queryCNACTStatus(int cid, bool &cidActive, String &ip)
 {
     String resp;
     modem.sendAT("+CNACT?");
     modem.waitResponse(5000, resp);
     SerialMon.print("AT+CNACT?: ");
     SerialMon.println(resp);
-    return parseCNACT(resp, cid1Active, ip);
+    return parseCNACTForCid(resp, cid, cidActive, ip);
 }
 
-bool detachPdpWithFallback()
+// Set the APN on CGDCONT context 1 (SIM7080 commonly uses 1..n for CGDCONT)
+bool setApnCid0()
 {
-    SerialMon.println("Detaching PDP/CGATT...");
-    bool detached = false;
-    for (int attempt = 0; attempt < 3 && !detached; ++attempt)
-    {
-        modem.sendAT("+CGACT=0,1");
-        modem.waitResponse(5000);
+    String resp; // <-- must exist in this scope
 
-        modem.sendAT("+CGATT=0");
-        modem.waitResponse(5000);
+    String cmd = String("+CGDCONT=1,\"IP\",\"") + APN + "\"";
+    SerialMon.print("AT");
+    SerialMon.println(cmd);
 
-        detached = waitForCgattState(0, 10000);
-        if (!detached)
-        {
-            SerialMon.println("CGATT detach pending, retry...");
+    modem.sendAT(cmd);
+    int8_t r = modem.waitResponse(5000, resp);
+
+    SerialMon.print("CGDCONT resp: ");
+    SerialMon.println(resp);
+
+    if (r != 1) {
+        SerialMon.println("Failed to set CGDCONT(1) APN.");
+        return false;
+    }
+
+    SerialMon.println("CGDCONT(1) set OK.");
+    return true;
+}
+
+// Activate bearer CID0 (CNACT 0) and return its assigned IP
+bool activateCid0(String &ipOut)
+{
+    ipOut = "";
+
+    // Ensure we’re attached
+    SerialMon.println("AT+CGATT=1");
+    modem.sendAT("+CGATT=1");
+    if (modem.waitResponse(15000) != 1) {
+        SerialMon.println("CGATT=1 failed");
+        return false;
+    }
+
+    // Activate bearer 0
+    SerialMon.println("AT+CNACT=0,1");
+    modem.sendAT("+CNACT=0,1");
+    if (modem.waitResponse(20000) != 1) {
+        SerialMon.println("CNACT=0,1 failed");
+        return false;
+    }
+
+    // Query bearer state and parse the IP for CID0
+    String resp;
+    modem.sendAT("+CNACT?");
+    modem.waitResponse(5000, resp);
+
+    SerialMon.print("CNACT?: ");
+    SerialMon.println(resp);
+
+    // Example: +CNACT: 0,1,"10.123.45.67"
+    int cid = -1;
+    int state = 0;
+    char ip[32] = {0};
+
+    // Parse line for CID0
+    if (sscanf(resp.c_str(), "+CNACT: %d,%d,\"%31[^\"]\"", &cid, &state, ip) >= 2) {
+        if (cid == 0 && state == 1 && strlen(ip) > 0) {
+            ipOut = ip;
+            SerialMon.print("CID0 active. IP: ");
+            SerialMon.println(ipOut);
+            return true;
         }
     }
 
-    if (!detached)
-    {
-        SerialMon.println("CGATT detach failed, toggling CFUN...");
-        modem.sendAT("+CFUN=0");
-        modem.waitResponse(5000);
-        delay(5000);
-        modem.sendAT("+CFUN=1");
-        modem.waitResponse(5000);
-        detached = waitForCgattState(0, 10000);
+    // If resp contains multiple lines, scan manually for "+CNACT: 0,1,"
+    int idx = resp.indexOf("+CNACT: 0,1,");
+    if (idx >= 0) {
+        int q1 = resp.indexOf('"', idx);
+        int q2 = resp.indexOf('"', q1 + 1);
+        if (q1 >= 0 && q2 > q1) {
+            ipOut = resp.substring(q1 + 1, q2);
+            SerialMon.print("CID0 active. IP: ");
+            SerialMon.println(ipOut);
+            return true;
+        }
     }
 
-    bool cid1Active = false;
-    String ip;
-    queryCNACTStatus(cid1Active, ip);
-    if (cid1Active)
-    {
-        SerialMon.printf("CID1 still active, IP: %s\n", ip.c_str());
-    }
-    else
-    {
-        SerialMon.println("CID1 inactive.");
-    }
-
-    if (!detached)
-    {
-        logHint("Detach failed. CGATT stayed 1.");
-    }
-    return detached;
+    SerialMon.println("CID0 not active after CNACT. Check CNACT output above.");
+    return false;
 }
 
-bool activatePdp(String &ipOut)
+
+void deactivateCid0()
 {
-    SerialMon.println("=== Cellular attach + PDP ===");
-    ensureGnssOff();
+    SerialMon.println("Deactivating CID0 / detaching...");
+    modem.sendAT("+CNACT=0,0");
+    modem.waitResponse(10000);
 
-    modem.sendAT("+CFUN=1");
+    modem.sendAT("+CGATT=0");
     modem.waitResponse(5000);
+    waitForCgattState(0, 10000);
 
-    modem.sendAT("+CGNSPWR=0");
-    modem.waitResponse(2000);
+    bool cidActive = false;
+    String ip;
+    queryCNACTStatus(0, cidActive, ip);
 
-    String apnCmd = String("+CGDCONT=1,\"IP\",\"") + APN + "\"";
-    modem.sendAT(apnCmd.c_str());
-    modem.waitResponse(5000);
+    SerialMon.printf("CID0 state after deactivate: %s, IP: %s\n",
+                     cidActive ? "active" : "inactive",
+                     ip.c_str());
+    int state = getCgattState();
+    SerialMon.printf("CGATT after deactivate: %d\n", state);
+}
 
-    modem.sendAT("+CGATT=1");
-    modem.waitResponse(5000);
-
-    if (!waitForCgattState(1, 60000))
-    {
-        logHint("CGATT did not reach 1.");
-        return false;
-    }
-
+bool dnsCheck(const char *host)
+{
     String resp;
-    modem.sendAT("+CNACT=1,1");
+    modem.sendAT("+CDNSGIP=\"", host, "\"");
     modem.waitResponse(10000, resp);
-    SerialMon.print("AT+CNACT=1,1 -> ");
+    SerialMon.print("DNS response: ");
     SerialMon.println(resp);
 
-    bool cid1Active = false;
-    String ip;
-    queryCNACTStatus(cid1Active, ip);
+    bool ok = resp.indexOf("+CDNSGIP:") >= 0 && resp.indexOf("ERROR") < 0;
+    SerialMon.println(ok ? "DNS ok" : "DNS failed");
+    return ok;
+}
 
-    if (!cid1Active || ip == "0.0.0.0")
-    {
-        logHint("CNACT did not show active IP for CID1.");
-        ipOut = ip;
-        return false;
-    }
+bool pingCheck()
+{
+    String resp;
+    modem.sendAT("+SNPING4=\"8.8.8.8\",1,16,1000");
+    modem.waitResponse(10000, resp);
+    SerialMon.print("Ping response: ");
+    SerialMon.println(resp);
 
-    ipOut = ip;
-    SerialMon.printf("PDP active. IP: %s\n", ip.c_str());
-    return true;
+    bool ok = resp.indexOf("+SNPING4:") >= 0 && resp.indexOf("timeout") < 0 && resp.indexOf("ERROR") < 0;
+    SerialMon.println(ok ? "Ping ok" : "Ping failed");
+    return ok;
+}
+
+bool tlsConnectTest(const char *host, uint16_t port)
+{
+    SerialMon.printf("TLS test connect to %s:%u...\n", host, port);
+    bool ok = tlsClient.connect(host, port);
+    SerialMon.println(ok ? "TLS connect ok" : "TLS connect failed");
+    tlsClient.stop();
+    return ok;
 }
 
 void runCellularCycle()
@@ -724,28 +778,36 @@ void runCellularCycle()
     printSignalAndReg();
 
     String ip;
-    if (!activatePdp(ip))
+    if (!activateCid0(ip))
     {
         logHint("PDP activation failed.");
         return;
     }
 
-    sendIngestIfReady();
+    const char *ingestHost = "us-central1-wurdemaniot.cloudfunctions.net";
+    dnsCheck(ingestHost);
+    pingCheck();
+    tlsConnectTest("www.google.com", 443);
+
+    if (!lastFix.hasFix)
+    {
+        SerialMon.println("Skipping upload: no GNSS fix captured.");
+    }
+    else
+    {
+        sendIngestIfReady();
+    }
 
     delay(PDP_ACTIVE_MS);
-    detachPdpWithFallback();
+    deactivateCid0();
 }
 
 void runGnssCycle()
 {
     printModeHeader("GNSS mode", ANSI_CYAN);
 
-    if (!detachPdpWithFallback())
-    {
-        logHint("Skipping GNSS because detach failed.");
-        ensureGnssOff();
-        return;
-    }
+    deactivateCid0();
+    ensureGnssOff();
 
     modem.sendAT("+CFUN=0"); // reduce RF use during GNSS
     modem.waitResponse(3000);
@@ -841,6 +903,8 @@ void setup()
         logHint("Modem did not respond to AT. Check UART pins or power rails.");
     }
 
+    // SIM7080 secure client uses modem-side TLS; no CA loaded yet, so validation is effectively disabled.
+
     nextGnssAt = millis();
 }
 
@@ -855,10 +919,9 @@ void loop()
 
     runGnssCycle();
 
-    // Send over WiFi if at home; otherwise send based on mode (cellular allowed outside home).
     if (currentMode == TrackerMode::Home)
     {
-        sendIngestIfReady();
+        runCellularCycle();
         nextGnssAt = millis() + HOME_INTERVAL_MS;
     }
     else
@@ -867,5 +930,3 @@ void loop()
         nextGnssAt = millis() + (currentMode == TrackerMode::Nearby ? NEARBY_INTERVAL_MS : ROAM_INTERVAL_MS);
     }
 }
-
-

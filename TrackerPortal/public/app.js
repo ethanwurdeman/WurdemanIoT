@@ -13,7 +13,9 @@ import {
   limit,
   onSnapshot,
   orderBy,
-  query
+  query,
+  setDoc,
+  updateDoc
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 import { firebaseConfig } from "./firebase-config.js";
 
@@ -197,6 +199,7 @@ function buildDeviceCard(id, data) {
   const lastDate = toDate(data?.last?.ts) || toDate(data?.updatedAt);
   const battery = data?.last?.battery ?? data?.battery;
   const typeLabel = data?.type ?? "unknown";
+  const modeLabel = data?.mode || data?.last?.mode || (data?.forceRoaming ? "roaming" : "unknown");
 
   card.innerHTML = `
     <div class="actions">
@@ -208,9 +211,10 @@ function buildDeviceCard(id, data) {
     </div>
     <div class="meta">
       <span>Type: ${typeLabel}</span>
-      <span>Battery: ${battery != null ? `${battery}%` : "—"}</span>
+      <span>Battery: ${battery != null ? `${battery}%` : "n/a"}</span>
+      <span>Mode: ${modeLabel}</span>
     </div>
-    <p class="muted">Last update: ${lastDate ? formatDate(lastDate) : "—"}</p>
+    <p class="muted">Last update: ${lastDate ? formatDate(lastDate) : "n/a"}</p>
     <div class="actions">
       <div class="pill">ID: ${id}</div>
       ${renderTrackLink(id, typeLabel)}
@@ -223,10 +227,10 @@ function buildDeviceCard(id, data) {
 function renderTrackLink(id, typeLabel) {
   const type = (typeLabel || "").toLowerCase();
   if (type === "dog") {
-    return `<a class="btn" href="#/dog/${id}" aria-label="Track ${id}">Track dog →</a>`;
+    return `<a class="btn" href="#/dog/${id}" aria-label="Track ${id}">Track dog ›</a>`;
   }
   if (type === "pet") {
-    return `<a class="btn" href="#/pet/${id}" aria-label="Track ${id}">Track pet →</a>`;
+    return `<a class="btn" href="#/pet/${id}" aria-label="Track ${id}">Track pet ›</a>`;
   }
   return `<span class="muted">No route</span>`;
 }
@@ -254,19 +258,28 @@ function renderDog(deviceId, label = "Dog") {
     <div class="stats-grid">
       <div class="stat">
         <div class="label">Battery</div>
-        <div class="value" id="stat-battery">—</div>
+        <div class="value" id="stat-battery">-</div>
       </div>
       <div class="stat">
         <div class="label">Satellites</div>
-        <div class="value" id="stat-sats">—</div>
+        <div class="value" id="stat-sats">-</div>
       </div>
       <div class="stat">
         <div class="label">HDOP</div>
-        <div class="value" id="stat-hdop">—</div>
+        <div class="value" id="stat-hdop">-</div>
       </div>
       <div class="stat">
         <div class="label">Last update</div>
-        <div class="value" id="stat-updated">—</div>
+        <div class="value" id="stat-updated">-</div>
+      </div>
+    </div>
+
+    <div class="mode-row">
+      <div class="pill" id="mode-pill"><span class="dot"></span>Mode: —</div>
+      <div class="pill" id="force-pill">Force roaming: off</div>
+      <div class="mode-actions">
+        <button class="btn" type="button" id="force-roam-btn">Force roaming</button>
+        <button class="btn ghost" type="button" id="clear-force-btn">Clear override</button>
       </div>
     </div>
 
@@ -366,10 +379,12 @@ function updateDogUI(deviceId, data) {
   statusEl.className = `pill ${status}`;
   statusEl.innerHTML = `<span class="dot"></span>${status.toUpperCase()}`;
 
-  batteryEl.textContent = last?.battery != null ? `${last.battery}%` : "—";
-  satsEl.textContent = last?.sats != null ? last.sats : "—";
-  hdopEl.textContent = last?.hdop != null ? last.hdop : "—";
-  updatedEl.textContent = last?.ts ? formatDate(toDate(last.ts)) : "—";
+  batteryEl.textContent = last?.battery != null ? `${last.battery}%` : "-";
+  satsEl.textContent = last?.sats != null ? last.sats : "-";
+  hdopEl.textContent = last?.hdop != null ? last.hdop : "-";
+  updatedEl.textContent = last?.ts ? formatDate(toDate(last.ts)) : "-";
+
+  updateModeUI(deviceId, data);
 
   const lat = Number(last?.lat);
   const lon = Number(last?.lon);
@@ -383,6 +398,73 @@ function updateDogUI(deviceId, data) {
     if (!state.polyline) {
       state.map.setView(pos, 15);
     }
+  }
+}
+
+function updateModeUI(deviceId, data) {
+  const modePill = document.getElementById("mode-pill");
+  const forcePill = document.getElementById("force-pill");
+  const forceBtn = document.getElementById("force-roam-btn");
+  const clearBtn = document.getElementById("clear-force-btn");
+
+  const mode = normalizeMode(data?.mode || data?.last?.mode);
+  const forceRoam = !!data?.forceRoaming;
+
+  if (modePill) {
+    modePill.className = `pill ${modeClass(mode)}`;
+    modePill.innerHTML = `<span class="dot"></span>Mode: ${mode}`;
+  }
+
+  if (forcePill) {
+    forcePill.className = `pill ${forceRoam ? "online" : "stale"}`;
+    forcePill.textContent = forceRoam ? "Force roaming: on" : "Force roaming: off";
+  }
+
+  if (forceBtn) {
+    forceBtn.disabled = forceRoam;
+    forceBtn.onclick = () => setForceRoaming(deviceId, true);
+  }
+  if (clearBtn) {
+    clearBtn.disabled = !forceRoam;
+    clearBtn.onclick = () => setForceRoaming(deviceId, false);
+  }
+}
+
+async function setForceRoaming(deviceId, enabled) {
+  const meta = document.getElementById("history-meta");
+  if (meta) meta.textContent = enabled ? "Enabling force roaming..." : "Clearing override...";
+  try {
+    await setDoc(
+      doc(db, "devices", deviceId),
+      { forceRoaming: enabled, modeCommand: enabled ? "roaming" : null },
+      { merge: true }
+    );
+    if (meta) meta.textContent = enabled ? "Force roaming set." : "Override cleared.";
+  } catch (err) {
+    console.error("Force roaming update failed", err);
+    if (meta) meta.textContent = `Force roaming error: ${err.message}`;
+  }
+}
+
+function normalizeMode(mode) {
+  if (!mode) return "unknown";
+  const m = String(mode).toLowerCase();
+  if (m.includes("home")) return "home";
+  if (m.includes("near")) return "nearby";
+  if (m.includes("roam")) return "roaming";
+  return mode;
+}
+
+function modeClass(mode) {
+  switch (mode) {
+    case "home":
+      return "online";
+    case "nearby":
+      return "stale";
+    case "roaming":
+      return "online";
+    default:
+      return "offline";
   }
 }
 
@@ -422,7 +504,7 @@ function toDate(ts) {
 }
 
 function formatDate(date) {
-  if (!date) return "—";
+  if (!date) return "-";
   return new Intl.DateTimeFormat("en", {
     month: "short",
     day: "numeric",

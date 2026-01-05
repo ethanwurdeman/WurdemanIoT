@@ -294,6 +294,24 @@ a {
   font-size: 13px;
 }
 
+.mode-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  margin: 12px 0 6px;
+}
+
+.mode-actions {
+  display: inline-flex;
+  gap: 8px;
+}
+
+.btn.ghost {
+  background: transparent;
+  border-color: rgba(148, 163, 184, 0.4);
+}
+
 .back-link {
   color: var(--accent-strong);
   display: inline-flex;
