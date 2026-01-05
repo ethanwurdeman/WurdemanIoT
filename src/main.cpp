@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <ctime>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 
 #define XPOWERS_CHIP_AXP2101
 #include <XPowersLib.h>
@@ -15,6 +16,45 @@
 #define TINY_GSM_MODEM_SIM7080
 #include <TinyGsmClient.h>
 
+// Google Trust Services Root R1 (for *.cloudfunctions.net)
+static const char GTS_ROOT_R1[] PROGMEM = R"EOF(-----BEGIN CERTIFICATE-----
+MIIFjTCCA3WgAwIBAgIQAnmsRYvBskWr+YV0b3v4sjANBgkqhkiG9w0BAQsFADBh
+MQswCQYDVQQGEwJVUzEhMB8GA1UEChMYR29vZ2xlIFRydXN0IFNlcnZpY2VzIExM
+QzEzMDEGA1UEAxMqR1RTIFJvb3QgUjEgLSBmb3IgU1NMIENlcnRpZmljYXRpb24g
+QXV0aG9yaXRpZXMwHhcNMjAwOTAyMDcwMzU5WhcNMzUwOTAyMDcwMzU5WjBhMQsw
+CQYDVQQGEwJVUzEhMB8GA1UEChMYR29vZ2xlIFRydXN0IFNlcnZpY2VzIExMQzEz
+MDEGA1UEAxMqR1RTIFJvb3QgUjEgLSBmb3IgU1NMIENlcnRpZmljYXRpb24gQXV0
+aG9yaXRpZXMwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQCt6KRAd9oo
+0g2yGXeR7nL5dCV52ou6ELDT/Q70OQfC1m7eHM8AioV50Eq1qg+FLhe7KOTYoIfQ
+3DNGdeMjM1ekAcVO/z3eWQpUXYzl13bQ96xq/EL5hkSbV/yDL49LzK7g0VB+c6+0
+tTPlCjtj53IHYQdSLy82qScEoa7GXA3nEuG8ZpL99QU1wu4kQ2pGLODe6hZ7shGP
++Z4lC4GdhfnRzRz8oQ18YQUB0dF7OUnfS2qJEgQS27D0G7DdIir3FO8aYlCbntsM
+zqXJMuRB4LXwR6GL4rqGDKgmN48/TpKh+okf3oyQYhCkS9c4LwVC8y67pZGFHdKn
+rM5R18ZwbIs5mUSgUA07TQX/T4vEljjUBC0doc84ZtA6m0fZKq8A33zmFc4lhfJU
+yVVd5xpd94XC5lxR2sKmUU5WQiVt1Ame+IPqqZGqV2PWXLmvU31/yMf+Se8G6avP
+K8ZsHISCBH5fC5iyzNoS5kggakdOSHMyLA+Y7bbrc6mCzY0CaJwIfB3dM68rOMqe
+4GPK3Fy9+q1TS0NQOQv22Q9GgttwYBHuoE22kJeXAmL1DUbq/m5LC8WC6Yfhx3vB
+kuk9iYq7ZeA9ZloYZemkk0ovXQpTV5xqmFcfcJ/mC2R0YbyK3R0YH1iR2m2w5DqJ
+Sk10xyIuvb6jE7eA1A5Gk7Fv0NqTHJAQ9rcTFA6ts04wPHuYHq7pynrz8lTcnDwI
+DAQABo0IwQDAOBgNVHQ8BAf8EBAMCAQYwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4E
+FgQUUWj/kK8CB3U8zNllZGKiErhZcjswDQYJKoZIhvcNAQELBQADggIBABn6y0f4
+7v2c2EvbzvUCELM95bAeaGGeF2DFmgh7kZL/hYRptqTqOB0fZYEQcRDQsmU56NZf
+mGq71GqXKFeG71lrj13HQJKyVDVk2Lj5WEJh4MCQblVeDJjbfn4W59y3SZEHhFRw
+L1mfZC6QnRFXcRf6vNp4ZjhFM/v1WqlJzTZ8R5g2DIrZSNlKqKXua3rXNtvBDg3W
+cBHQYaWxjUXv0hLOWR1QGSP4dtEyrDqRLpZYcG8Tz7bRjFYwg9sL7xDfa2HCIQ0/
+cU0I78WAs6eXgwBAkLT9QF3fTY5c6XME+kDp+VR2iVO5dIDi60f2xCF3qV6B9FX0
+tE3DTnM/pCIbcbc6MQWBI0dyJ5Pw1sOEk30qtnW6fp0pj3SaSxBpkkj8VQUXQWD+
+nHNKDwewVgVQtdS5eyJbDy4eu6TpArOSLfp2mGMRNs6FqD+4TNKFIkjiZxexV0v8
+V1/1Lw9MmmLUtYR+n2mR6jF3Gdq5GgWFcrrC6gxyocnQTsX/8DH9VFBUSDXaDYBJ
+4GKuOKcwB5z+W5M2+h5ZkUt7Q2pIqkS9Zl2lE8dKtxnU9p9+ON8DS2i+HtCkZIGl
+0ssaN8iTQWvkjzS2pB9rbAiSlzZlZTa3YL6hFLaeLQCa7H2EAkGQxkGHWhpi6D3a
+vBIgZScpmloRqDrahYRCm5xC
+-----END CERTIFICATE-----)EOF";
+
+#define ANSI_GREEN "\x1b[32m"
+#define ANSI_CYAN "\x1b[36m"
+#define ANSI_RESET "\x1b[0m"
+
 #if ENABLE_AT_DEBUG
 #include <StreamDebugger.h>
 StreamDebugger debugger(SerialAT, SerialMon);
@@ -23,8 +63,8 @@ TinyGsm modem(debugger);
 TinyGsm modem(SerialAT);
 #endif
 
-TinyGsmClient netClient(modem);
-WiFiClient wifiClient;
+TinyGsmClientSecure netClient(modem);
+WiFiClientSecure wifiClient;
 XPowersPMU pmu;
 
 enum class CyclePhase
@@ -91,6 +131,15 @@ bool readChargingStatus()
     return pmu.isCharging();
 }
 
+void printModeHeader(const char *label, const char *color)
+{
+    SerialMon.print(color);
+    SerialMon.print("\n=== ");
+    SerialMon.print(label);
+    SerialMon.println(" ===");
+    SerialMon.print(ANSI_RESET);
+}
+
 time_t portableTimegm(struct tm *t)
 {
 #if defined(_WIN32)
@@ -147,10 +196,13 @@ bool sendIngestIfReady()
     }
 
     const char *host = "us-central1-wurdemaniot.cloudfunctions.net";
-    const uint16_t port = 80;
+    const uint16_t port = 443;
     const char *path = "/ingest";
 
     const bool wifiUp = connectWiFiIfConfigured() && WiFi.isConnected();
+    netClient.setCACert(GTS_ROOT_R1);
+    wifiClient.setCACert(GTS_ROOT_R1);
+
     Client *client = wifiUp ? static_cast<Client *>(&wifiClient) : static_cast<Client *>(&netClient);
 
     if (!client->connect(host, port))
@@ -688,7 +740,7 @@ bool activatePdp(String &ipOut)
 
 void runCellularCycle()
 {
-    SerialMon.println("\n=== Cellular mode ===");
+    printModeHeader("Cellular mode", ANSI_GREEN);
     ensureGnssOff();
     modem.sendAT("+CFUN=1");
     modem.waitResponse(5000);
@@ -722,7 +774,7 @@ void runCellularCycle()
 
 void runGnssCycle()
 {
-    SerialMon.println("\n=== GNSS mode ===");
+    printModeHeader("GNSS mode", ANSI_CYAN);
 
     if (!detachPdpWithFallback())
     {

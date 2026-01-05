@@ -2,8 +2,8 @@
 
 // APN credentials for cellular attach/PDP context
 static const char *APN        = "hologram";
-static const char *APN_USER   = "";
-static const char *APN_PASS   = "";
+static const char *APN_USER   = "Wurdeman Starlink 2.4";
+static const char *APN_PASS   = "Koda2020";
 
 // WiFi credentials for home network (optional)
 static const char *WIFI_SSID  = "";
