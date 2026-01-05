@@ -4,6 +4,9 @@
 #include <ctime>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 #define XPOWERS_CHIP_AXP2101
 #include <XPowersLib.h>
@@ -15,41 +18,6 @@
 
 #define TINY_GSM_MODEM_SIM7080
 #include <TinyGsmClient.h>
-
-// Google Trust Services Root R1 (for *.cloudfunctions.net)
-static const char GTS_ROOT_R1[] PROGMEM = R"EOF(-----BEGIN CERTIFICATE-----
-MIIFjTCCA3WgAwIBAgIQAnmsRYvBskWr+YV0b3v4sjANBgkqhkiG9w0BAQsFADBh
-MQswCQYDVQQGEwJVUzEhMB8GA1UEChMYR29vZ2xlIFRydXN0IFNlcnZpY2VzIExM
-QzEzMDEGA1UEAxMqR1RTIFJvb3QgUjEgLSBmb3IgU1NMIENlcnRpZmljYXRpb24g
-QXV0aG9yaXRpZXMwHhcNMjAwOTAyMDcwMzU5WhcNMzUwOTAyMDcwMzU5WjBhMQsw
-CQYDVQQGEwJVUzEhMB8GA1UEChMYR29vZ2xlIFRydXN0IFNlcnZpY2VzIExMQzEz
-MDEGA1UEAxMqR1RTIFJvb3QgUjEgLSBmb3IgU1NMIENlcnRpZmljYXRpb24gQXV0
-aG9yaXRpZXMwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQCt6KRAd9oo
-0g2yGXeR7nL5dCV52ou6ELDT/Q70OQfC1m7eHM8AioV50Eq1qg+FLhe7KOTYoIfQ
-3DNGdeMjM1ekAcVO/z3eWQpUXYzl13bQ96xq/EL5hkSbV/yDL49LzK7g0VB+c6+0
-tTPlCjtj53IHYQdSLy82qScEoa7GXA3nEuG8ZpL99QU1wu4kQ2pGLODe6hZ7shGP
-+Z4lC4GdhfnRzRz8oQ18YQUB0dF7OUnfS2qJEgQS27D0G7DdIir3FO8aYlCbntsM
-zqXJMuRB4LXwR6GL4rqGDKgmN48/TpKh+okf3oyQYhCkS9c4LwVC8y67pZGFHdKn
-rM5R18ZwbIs5mUSgUA07TQX/T4vEljjUBC0doc84ZtA6m0fZKq8A33zmFc4lhfJU
-yVVd5xpd94XC5lxR2sKmUU5WQiVt1Ame+IPqqZGqV2PWXLmvU31/yMf+Se8G6avP
-K8ZsHISCBH5fC5iyzNoS5kggakdOSHMyLA+Y7bbrc6mCzY0CaJwIfB3dM68rOMqe
-4GPK3Fy9+q1TS0NQOQv22Q9GgttwYBHuoE22kJeXAmL1DUbq/m5LC8WC6Yfhx3vB
-kuk9iYq7ZeA9ZloYZemkk0ovXQpTV5xqmFcfcJ/mC2R0YbyK3R0YH1iR2m2w5DqJ
-Sk10xyIuvb6jE7eA1A5Gk7Fv0NqTHJAQ9rcTFA6ts04wPHuYHq7pynrz8lTcnDwI
-DAQABo0IwQDAOBgNVHQ8BAf8EBAMCAQYwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4E
-FgQUUWj/kK8CB3U8zNllZGKiErhZcjswDQYJKoZIhvcNAQELBQADggIBABn6y0f4
-7v2c2EvbzvUCELM95bAeaGGeF2DFmgh7kZL/hYRptqTqOB0fZYEQcRDQsmU56NZf
-mGq71GqXKFeG71lrj13HQJKyVDVk2Lj5WEJh4MCQblVeDJjbfn4W59y3SZEHhFRw
-L1mfZC6QnRFXcRf6vNp4ZjhFM/v1WqlJzTZ8R5g2DIrZSNlKqKXua3rXNtvBDg3W
-cBHQYaWxjUXv0hLOWR1QGSP4dtEyrDqRLpZYcG8Tz7bRjFYwg9sL7xDfa2HCIQ0/
-cU0I78WAs6eXgwBAkLT9QF3fTY5c6XME+kDp+VR2iVO5dIDi60f2xCF3qV6B9FX0
-tE3DTnM/pCIbcbc6MQWBI0dyJ5Pw1sOEk30qtnW6fp0pj3SaSxBpkkj8VQUXQWD+
-nHNKDwewVgVQtdS5eyJbDy4eu6TpArOSLfp2mGMRNs6FqD+4TNKFIkjiZxexV0v8
-V1/1Lw9MmmLUtYR+n2mR6jF3Gdq5GgWFcrrC6gxyocnQTsX/8DH9VFBUSDXaDYBJ
-4GKuOKcwB5z+W5M2+h5ZkUt7Q2pIqkS9Zl2lE8dKtxnU9p9+ON8DS2i+HtCkZIGl
-0ssaN8iTQWvkjzS2pB9rbAiSlzZlZTa3YL6hFLaeLQCa7H2EAkGQxkGHWhpi6D3a
-vBIgZScpmloRqDrahYRCm5xC
------END CERTIFICATE-----)EOF";
 
 #define ANSI_GREEN "\x1b[32m"
 #define ANSI_CYAN "\x1b[36m"
@@ -63,18 +31,9 @@ TinyGsm modem(debugger);
 TinyGsm modem(SerialAT);
 #endif
 
-TinyGsmClientSecure netClient(modem);
-WiFiClientSecure wifiClient;
+TinyGsmClient netClient(modem);
+WiFiClient wifiClient;
 XPowersPMU pmu;
-
-enum class CyclePhase
-{
-    Cellular,
-    Gnss
-};
-
-static CyclePhase nextPhase = CyclePhase::Cellular;
-static unsigned long nextPhaseAt = 0;
 
 struct FixPayload
 {
@@ -89,34 +48,29 @@ struct FixPayload
 static FixPayload lastFix;
 static uint64_t cellTxBytes = 0;
 static uint64_t cellRxBytes = 0;
+static unsigned long nextGnssAt = 0;
 
-bool connectWiFiIfConfigured()
+enum class TrackerMode
 {
-    if (strlen(WIFI_SSID) == 0)
-    {
-        return false;
-    }
-    if (WiFi.isConnected())
-    {
-        return true;
-    }
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    SerialMon.printf("Connecting WiFi SSID %s...\n", WIFI_SSID);
-    unsigned long start = millis();
-    while (millis() - start < 8000)
-    {
-        if (WiFi.isConnected())
-        {
-            SerialMon.printf("WiFi connected, IP: %s\n", WiFi.localIP().toString().c_str());
-            return true;
-        }
-        delay(200);
-    }
-    SerialMon.println("WiFi connect timeout.");
-    return false;
-}
+    Home,
+    Nearby,
+    Roaming
+};
 
+static TrackerMode currentMode = TrackerMode::Home;
+
+// Home base geofence (degrees) and radii (meters)
+constexpr double HOME_LAT = 41.74570242514908;
+constexpr double HOME_LON = -103.36769502711984;
+constexpr double HOME_RADIUS_M = 76.2;   // 250 ft
+constexpr double NEARBY_RADIUS_M = 228.6; // 750 ft
+
+// Cadence per mode
+constexpr uint32_t HOME_INTERVAL_MS = 5UL * 60UL * 1000UL;
+constexpr uint32_t NEARBY_INTERVAL_MS = 2UL * 60UL * 1000UL;
+constexpr uint32_t ROAM_INTERVAL_MS = 15UL * 1000UL;
+
+bool connectWiFiIfConfigured() { return false; }
 int readBatteryPercent()
 {
     if (!pmu.isBatteryConnect())
@@ -187,6 +141,18 @@ uint64_t toEpochMs(int year, int month, int day, int hour, int minute, int secon
     return static_cast<uint64_t>(ts) * 1000ULL;
 }
 
+double distanceMeters(double lat1, double lon1, double lat2, double lon2)
+{
+    constexpr double kEarthRadiusM = 6371000.0;
+    auto toRad = [](double deg) { return deg * M_PI / 180.0; };
+    double dLat = toRad(lat2 - lat1);
+    double dLon = toRad(lon2 - lon1);
+    double a = sin(dLat / 2) * sin(dLat / 2) +
+               cos(toRad(lat1)) * cos(toRad(lat2)) * sin(dLon / 2) * sin(dLon / 2);
+    double c = 2 * atan2(sqrt(a), sqrt(1 - a));
+    return kEarthRadiusM * c;
+}
+
 bool sendIngestIfReady()
 {
     if (!lastFix.hasFix)
@@ -199,23 +165,10 @@ bool sendIngestIfReady()
     const uint16_t port = 443;
     const char *path = "/ingest";
 
-    const bool wifiUp = connectWiFiIfConfigured() && WiFi.isConnected();
-    if (wifiUp) {
-        wifiClient.setInsecure(); // skip cert validation for now
-    }
-
+    const bool wifiUp = WiFi.isConnected();
     Client *client = wifiUp ? static_cast<Client *>(&wifiClient) : static_cast<Client *>(&netClient);
 
-    // Use TLS for both paths. WiFiClientSecure handles TLS; TinyGsmClientSecure
-    // requires the SSL flag on connect.
-    bool connected = false;
-    if (wifiUp) {
-        connected = client->connect(host, port);
-    } else {
-        connected = static_cast<TinyGsmClientSecure *>(client)->connect(host, port, true);
-    }
-
-    if (!connected)
+    if (!client->connect(host, port))
     {
         SerialMon.println("HTTP connect failed.");
         return false;
@@ -751,6 +704,7 @@ bool activatePdp(String &ipOut)
 void runCellularCycle()
 {
     printModeHeader("Cellular mode", ANSI_GREEN);
+
     ensureGnssOff();
     modem.sendAT("+CFUN=1");
     modem.waitResponse(5000);
@@ -817,8 +771,8 @@ void runGnssCycle()
             SerialMon.println("GNSS fix acquired:");
             SerialMon.printf("  Lat: %.6f\n", lat);
             SerialMon.printf("  Lon: %.6f\n", lon);
-            SerialMon.printf("  Alt: %.2f m\n", alt);
-            SerialMon.printf("  Speed: %.2f kn\n", speed);
+            SerialMon.printf("  Alt: %.2f m (%.2f ft)\n", alt, alt * 3.28084);
+            SerialMon.printf("  Speed: %.2f kn (%.2f mph)\n", speed, speed * 1.15078);
             SerialMon.printf("  Sats(v/u): %d/%d\n", vsat, usat);
             SerialMon.printf("  HDOP/acc: %.2f\n", hdop);
             SerialMon.printf("  UTC: %04d-%02d-%02d %02d:%02d:%02d\n",
@@ -830,6 +784,23 @@ void runGnssCycle()
             lastFix.hdop = hdop;
             lastFix.sats = usat;
             lastFix.tsMs = toEpochMs(year, month, day, hour, minute, second);
+
+            double dist = distanceMeters(lat, lon, HOME_LAT, HOME_LON);
+            TrackerMode newMode = TrackerMode::Home;
+            if (dist > NEARBY_RADIUS_M)
+            {
+                newMode = TrackerMode::Roaming;
+            }
+            else if (dist > HOME_RADIUS_M)
+            {
+                newMode = TrackerMode::Nearby;
+            }
+            currentMode = newMode;
+            SerialMon.printf("Mode set to %s (dist %.1f m)\n",
+                             currentMode == TrackerMode::Home   ? "Home"
+                             : currentMode == TrackerMode::Nearby ? "Nearby"
+                                                                   : "Roaming",
+                             dist);
             break;
         }
         SerialMon.println("No fix yet...");
@@ -870,30 +841,31 @@ void setup()
         logHint("Modem did not respond to AT. Check UART pins or power rails.");
     }
 
-    nextPhaseAt = millis();
+    nextGnssAt = millis();
 }
 
 void loop()
 {
     unsigned long now = millis();
-    if (now < nextPhaseAt)
+    if (now < nextGnssAt)
     {
         delay(100);
         return;
     }
 
-    if (nextPhase == CyclePhase::Cellular)
+    runGnssCycle();
+
+    // Send over WiFi if at home; otherwise send based on mode (cellular allowed outside home).
+    if (currentMode == TrackerMode::Home)
     {
-        runCellularCycle();
-        nextPhase = CyclePhase::Gnss;
-        nextPhaseAt = millis() + GNSS_PERIOD_MS;
+        sendIngestIfReady();
+        nextGnssAt = millis() + HOME_INTERVAL_MS;
     }
     else
     {
-        runGnssCycle();
-        nextPhase = CyclePhase::Cellular;
-        nextPhaseAt = millis() + CELLULAR_PERIOD_MS;
+        runCellularCycle();
+        nextGnssAt = millis() + (currentMode == TrackerMode::Nearby ? NEARBY_INTERVAL_MS : ROAM_INTERVAL_MS);
     }
-
-    delay(CYCLE_PAUSE_MS);
 }
+
+

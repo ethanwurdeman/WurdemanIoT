@@ -2,12 +2,12 @@
 
 // APN credentials for cellular attach/PDP context
 static const char *APN        = "hologram";
-static const char *APN_USER   = "Wurdeman Starlink 2.4";
-static const char *APN_PASS   = "Koda2020";
+static const char *APN_USER   = "";
+static const char *APN_PASS   = "";
 
 // WiFi credentials for home network (optional)
-static const char *WIFI_SSID  = "";
-static const char *WIFI_PASS  = "";
+static const char *WIFI_SSID  = "Wurdeman Starlink 2.4";
+static const char *WIFI_PASS  = "Koda2024";
 
 // Serial settings
 constexpr uint32_t MODEM_BAUD           = 115200;
