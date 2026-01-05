@@ -91,6 +91,32 @@ bool readChargingStatus()
     return pmu.isCharging();
 }
 
+time_t portableTimegm(struct tm *t)
+{
+#if defined(_WIN32)
+    return _mkgmtime(t);
+#else
+    // Approximate timegm using mktime and offset between localtime and gmtime
+    time_t local = mktime(t);
+    if (local == static_cast<time_t>(-1))
+    {
+        return static_cast<time_t>(-1);
+    }
+    struct tm *gt = gmtime(&local);
+    if (!gt)
+    {
+        return static_cast<time_t>(-1);
+    }
+    time_t utc = mktime(gt);
+    if (utc == static_cast<time_t>(-1))
+    {
+        return static_cast<time_t>(-1);
+    }
+    double offset = difftime(local, utc);
+    return local + static_cast<time_t>(offset);
+#endif
+}
+
 uint64_t toEpochMs(int year, int month, int day, int hour, int minute, int second)
 {
     if (year < 1970 || month < 1 || day < 1)
@@ -104,11 +130,7 @@ uint64_t toEpochMs(int year, int month, int day, int hour, int minute, int secon
     t.tm_hour = hour;
     t.tm_min = minute;
     t.tm_sec = second;
-#if defined(_WIN32)
-    time_t ts = _mkgmtime(&t);
-#else
-    time_t ts = timegm(&t);
-#endif
+    time_t ts = portableTimegm(&t);
     if (ts < 0)
     {
         return millis();
