@@ -17,6 +17,10 @@ interface IngestBody {
   sats?: number | string;
   hdop?: number | string;
   enabled?: boolean;
+  charging?: boolean;
+  network?: string;
+  txBytes?: number | string;
+  rxBytes?: number | string;
 }
 
 export const ingest = onRequest(
@@ -66,31 +70,44 @@ export const ingest = onRequest(
     const deviceRef = db.collection("devices").doc(deviceId);
     const pointRef = deviceRef.collection("points").doc();
 
+    const charging = typeof body.charging === "boolean" ? body.charging : null;
+    const network = (body.network ?? "cell") as string;
+    const txBytes = parseNum(body.txBytes);
+    const rxBytes = parseNum(body.rxBytes);
+
     const payload = {
       lat,
       lon,
       ts,
       battery: battery ?? null,
       sats: sats ?? null,
-      hdop: hdop ?? null
+      hdop: hdop ?? null,
+      charging,
+      network,
+      txBytes: txBytes ?? null,
+      rxBytes: rxBytes ?? null
     };
 
     try {
       await db.runTransaction(async (tx) => {
-        tx.set(
-          deviceRef,
-          {
-            name: body.name ?? deviceId,
-            type: body.type ?? "dog",
-            enabled: body.enabled ?? true,
-            updatedAt: FieldValue.serverTimestamp(),
-            last: payload
-          },
-          { merge: true }
-        );
+        const deviceUpdate: Record<string, unknown> = {
+          name: body.name ?? deviceId,
+          type: body.type ?? "dog",
+          enabled: body.enabled ?? true,
+          updatedAt: FieldValue.serverTimestamp(),
+          last: payload
+        };
+
+        if (network === "cell") {
+          if (txBytes != null) deviceUpdate["usage.cellTxBytes"] = FieldValue.increment(txBytes);
+          if (rxBytes != null) deviceUpdate["usage.cellRxBytes"] = FieldValue.increment(rxBytes);
+        }
+
+        tx.set(deviceRef, deviceUpdate, { merge: true });
 
         tx.set(pointRef, {
           ...payload,
+          network,
           createdAt: FieldValue.serverTimestamp()
         });
       });

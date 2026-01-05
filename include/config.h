@@ -5,6 +5,10 @@ static const char *APN        = "hologram";
 static const char *APN_USER   = "";
 static const char *APN_PASS   = "";
 
+// WiFi credentials for home network (optional)
+static const char *WIFI_SSID  = "";
+static const char *WIFI_PASS  = "";
+
 // Serial settings
 constexpr uint32_t MODEM_BAUD           = 115200;
 constexpr uint8_t  MODEM_SERIAL_RX      = 4;

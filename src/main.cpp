@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <cstdio>
+#include <ctime>
+#include <WiFi.h>
 
 #define XPOWERS_CHIP_AXP2101
 #include <XPowersLib.h>
@@ -21,6 +23,8 @@ TinyGsm modem(debugger);
 TinyGsm modem(SerialAT);
 #endif
 
+TinyGsmClient netClient(modem);
+WiFiClient wifiClient;
 XPowersPMU pmu;
 
 enum class CyclePhase
@@ -31,6 +35,214 @@ enum class CyclePhase
 
 static CyclePhase nextPhase = CyclePhase::Cellular;
 static unsigned long nextPhaseAt = 0;
+
+struct FixPayload
+{
+    bool hasFix = false;
+    float lat = 0;
+    float lon = 0;
+    float hdop = 0;
+    int sats = 0;
+    uint64_t tsMs = 0;
+};
+
+static FixPayload lastFix;
+static uint64_t cellTxBytes = 0;
+static uint64_t cellRxBytes = 0;
+
+bool connectWiFiIfConfigured()
+{
+    if (strlen(WIFI_SSID) == 0)
+    {
+        return false;
+    }
+    if (WiFi.isConnected())
+    {
+        return true;
+    }
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    SerialMon.printf("Connecting WiFi SSID %s...\n", WIFI_SSID);
+    unsigned long start = millis();
+    while (millis() - start < 8000)
+    {
+        if (WiFi.isConnected())
+        {
+            SerialMon.printf("WiFi connected, IP: %s\n", WiFi.localIP().toString().c_str());
+            return true;
+        }
+        delay(200);
+    }
+    SerialMon.println("WiFi connect timeout.");
+    return false;
+}
+
+int readBatteryPercent()
+{
+    if (!pmu.isBatteryConnect())
+    {
+        return -1;
+    }
+    return pmu.getBatteryPercent();
+}
+
+bool readChargingStatus()
+{
+    return pmu.isCharging();
+}
+
+uint64_t toEpochMs(int year, int month, int day, int hour, int minute, int second)
+{
+    if (year < 1970 || month < 1 || day < 1)
+    {
+        return millis();
+    }
+    struct tm t = {};
+    t.tm_year = year - 1900;
+    t.tm_mon = month - 1;
+    t.tm_mday = day;
+    t.tm_hour = hour;
+    t.tm_min = minute;
+    t.tm_sec = second;
+#if defined(_WIN32)
+    time_t ts = _mkgmtime(&t);
+#else
+    time_t ts = timegm(&t);
+#endif
+    if (ts < 0)
+    {
+        return millis();
+    }
+    return static_cast<uint64_t>(ts) * 1000ULL;
+}
+
+bool sendIngestIfReady()
+{
+    if (!lastFix.hasFix)
+    {
+        SerialMon.println("No GNSS fix available to send.");
+        return false;
+    }
+
+    const char *host = "us-central1-wurdemaniot.cloudfunctions.net";
+    const uint16_t port = 80;
+    const char *path = "/ingest";
+
+    const bool wifiUp = connectWiFiIfConfigured() && WiFi.isConnected();
+    Client *client = wifiUp ? static_cast<Client *>(&wifiClient) : static_cast<Client *>(&netClient);
+
+    if (!client->connect(host, port))
+    {
+        SerialMon.println("HTTP connect failed.");
+        return false;
+    }
+
+    const int battPct = readBatteryPercent();
+    const bool charging = readChargingStatus();
+
+    auto makeBody = [&](size_t txBytesVal) {
+        String body;
+        body.reserve(256);
+        body += "{";
+        body += "\"deviceId\":\"Tyee\",";
+        body += "\"name\":\"Tyee\",";
+        body += "\"type\":\"pet\",";
+        body += "\"lat\":";
+        body += String(lastFix.lat, 6);
+        body += ",\"lon\":";
+        body += String(lastFix.lon, 6);
+        body += ",\"ts\":";
+        body += String(lastFix.tsMs);
+        body += ",\"battery\":";
+        body += (battPct >= 0 ? String(battPct) : "null");
+        body += ",\"charging\":";
+        body += (charging ? "true" : "false");
+        body += ",\"network\":\"";
+        body += (wifiUp ? "wifi" : "cell");
+        body += "\"";
+        body += ",\"txBytes\":";
+        body += String(txBytesVal);
+        body += ",\"rxBytes\":null";
+        body += ",\"sats\":";
+        body += String(lastFix.sats);
+        body += ",\"hdop\":";
+        body += String(lastFix.hdop, 2);
+        body += ",\"enabled\":true}";
+        return body;
+    };
+
+    auto makeHeaders = [&](size_t contentLength) {
+        String headers;
+        headers.reserve(256);
+        headers += "POST ";
+        headers += path;
+        headers += " HTTP/1.1\r\n";
+        headers += "Host: ";
+        headers += host;
+        headers += "\r\nContent-Type: application/json\r\n";
+        headers += "Content-Length: ";
+        headers += contentLength;
+        headers += "\r\nConnection: close\r\n\r\n";
+        return headers;
+    };
+
+    // two-pass to avoid content-length mismatch after inserting txBytes
+    String body = makeBody(0);
+    String headers = makeHeaders(body.length());
+    size_t txLen = headers.length() + body.length();
+    body = makeBody(txLen);
+    headers = makeHeaders(body.length());
+    txLen = headers.length() + body.length();
+
+    client->print(headers);
+    client->print(body);
+
+    bool ok = false;
+    String status;
+    size_t rxLen = 0;
+    unsigned long start = millis();
+    while (millis() - start < 10000UL)
+    {
+        while (client->available())
+        {
+            char c = client->read();
+            rxLen++;
+            if (c == '\n')
+            {
+                if (status.startsWith("HTTP/1.1 200") || status.startsWith("HTTP/1.0 200"))
+                {
+                    ok = true;
+                }
+                start = millis();
+            }
+            else if (c != '\r')
+            {
+                status += c;
+            }
+        }
+        if (!client->connected())
+        {
+            break;
+        }
+        delay(10);
+    }
+    client->stop();
+
+    SerialMon.printf("Ingest POST status: %s\n", status.c_str());
+
+    if (!wifiUp)
+    {
+        cellTxBytes += txLen;
+        cellRxBytes += rxLen;
+        SerialMon.printf("Cellular usage this send: tx=%u rx=%u bytes (total tx=%llu rx=%llu)\n",
+                         static_cast<unsigned>(txLen),
+                         static_cast<unsigned>(rxLen),
+                         static_cast<unsigned long long>(cellTxBytes),
+                         static_cast<unsigned long long>(cellRxBytes));
+    }
+
+    return ok;
+}
 
 void printPins()
 {
@@ -480,6 +692,8 @@ void runCellularCycle()
         return;
     }
 
+    sendIngestIfReady();
+
     delay(PDP_ACTIVE_MS);
     detachPdpWithFallback();
 }
@@ -525,6 +739,13 @@ void runGnssCycle()
             SerialMon.printf("  HDOP/acc: %.2f\n", hdop);
             SerialMon.printf("  UTC: %04d-%02d-%02d %02d:%02d:%02d\n",
                              year, month, day, hour, minute, second);
+
+            lastFix.hasFix = true;
+            lastFix.lat = lat;
+            lastFix.lon = lon;
+            lastFix.hdop = hdop;
+            lastFix.sats = usat;
+            lastFix.tsMs = toEpochMs(year, month, day, hour, minute, second);
             break;
         }
         SerialMon.println("No fix yet...");
