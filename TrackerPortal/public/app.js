@@ -36,9 +36,7 @@ const routes = [
   { pattern: /^\/home$/, handler: renderHome },
   { pattern: /^\/dog\/([^/]+)$/, handler: (_path, id) => renderDog(id) },
   { pattern: /^\/pet\/([^/]+)$/, handler: (_path, id) => renderPet(id) },
-  { pattern: /^\/vehicles$/, handler: () => renderComingSoon("Vehicles") },
-  { pattern: /^\/pets$/, handler: () => renderComingSoon("Pets") },
-  { pattern: /^\/kids$/, handler: () => renderComingSoon("Kids") }
+  { pattern: /^\/thermostat$/, handler: () => renderComingSoon("Thermostat") }
 ];
 
 const view = document.getElementById("view");
@@ -48,6 +46,11 @@ const signOutBtn = document.getElementById("sign-out-btn");
 const authStatus = document.getElementById("auth-status");
 const authEmail = document.getElementById("auth-email");
 const authPassword = document.getElementById("auth-password");
+const petsLink = document.getElementById("pets-link");
+
+if (petsLink) {
+  petsLink.href = "#/pet/Tyee";
+}
 
 authForm.addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -80,17 +83,24 @@ signOutBtn.addEventListener("click", async () => {
 
 onAuthStateChanged(auth, (user) => {
   state.user = user;
-  authStatus.textContent = user ? `Signed in as ${user.email}` : "Not signed in";
-  signInBtn.disabled = !!user;
-  signOutBtn.disabled = !user;
-  if (!user) {
-    authForm.reset();
-  }
+  updateAuthUI();
   router();
 });
 
 window.addEventListener("hashchange", router);
 router();
+
+function updateAuthUI() {
+  const user = state.user;
+  authStatus.textContent = user ? `Signed in as ${user.email}` : "";
+  authEmail.style.display = user ? "none" : "";
+  authPassword.style.display = user ? "none" : "";
+  signInBtn.style.display = user ? "none" : "";
+  signOutBtn.style.display = user ? "" : "none";
+  if (!user) {
+    authForm.reset();
+  }
+}
 
 function router() {
   const path = (window.location.hash.replace(/^#/, "") || "/home").replace(/\/+$/, "") || "/home";
