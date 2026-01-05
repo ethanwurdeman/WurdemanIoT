@@ -200,12 +200,22 @@ bool sendIngestIfReady()
     const char *path = "/ingest";
 
     const bool wifiUp = connectWiFiIfConfigured() && WiFi.isConnected();
-    netClient.setCACert(GTS_ROOT_R1);
-    wifiClient.setCACert(GTS_ROOT_R1);
+    if (wifiUp) {
+        wifiClient.setInsecure(); // skip cert validation for now
+    }
 
     Client *client = wifiUp ? static_cast<Client *>(&wifiClient) : static_cast<Client *>(&netClient);
 
-    if (!client->connect(host, port))
+    // Use TLS for both paths. WiFiClientSecure handles TLS; TinyGsmClientSecure
+    // requires the SSL flag on connect.
+    bool connected = false;
+    if (wifiUp) {
+        connected = client->connect(host, port);
+    } else {
+        connected = static_cast<TinyGsmClientSecure *>(client)->connect(host, port, true);
+    }
+
+    if (!connected)
     {
         SerialMon.println("HTTP connect failed.");
         return false;
@@ -220,7 +230,7 @@ bool sendIngestIfReady()
         body += "{";
         body += "\"deviceId\":\"Tyee\",";
         body += "\"name\":\"Tyee\",";
-        body += "\"type\":\"pet\",";
+    body += "\"type\":\"pet\",";
         body += "\"lat\":";
         body += String(lastFix.lat, 6);
         body += ",\"lon\":";
