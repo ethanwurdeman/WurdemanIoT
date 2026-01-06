@@ -1,6 +1,6 @@
-# TrackerPortal
+# WurdemanIoT
 
-Single-page Firebase Hosting app for monitoring multiple trackers with Firestore-backed data and a Cloud Function ingest endpoint.
+Single-page Firebase Hosting app for the WurdemanIoT control center plus Cloud Functions ingest.
 
 ## Stack
 - Firebase Hosting + Firestore
@@ -9,48 +9,41 @@ Single-page Firebase Hosting app for monitoring multiple trackers with Firestore
 - Cloud Functions (TypeScript, Node 20, firebase-functions v2 onRequest)
 
 ## Routes
-- `#/home` (default): device grid from `devices` collection with online/stale indicator and dog-card deep links.
-- `#/dog/{deviceId}`: live listener for `devices/{id}` last position, stats, and 200-point history polyline from `devices/{id}/points`.
-- `#/vehicles`, `#/pets`, `#/kids`: placeholder “Coming soon”.
+- `#/home`: device grid with online/stale indicators and deep links.
+- `#/dog/{deviceId}`: live last-location listener, config controls (geofence, ping cadence, force roam), day selector + scrubber, and history polyline.
+- `#/thermostat`: placeholder.
 
 ## Firestore data model
-- `devices/{deviceId}` fields: `name` (string), `type` (string), `enabled` (bool), `updatedAt` (serverTimestamp), `last` `{lat, lon, ts, battery, sats, hdop}`.
-- `devices/{deviceId}/points/{autoId}` fields: `lat, lon, ts, battery, sats, hdop, createdAt (serverTimestamp)`.
+- `devices/{deviceId}`:
+  - `name`, `type`, `enabled`, `updatedAt`
+  - `last`: `{ lat, lon, ts, battery, sats, hdop, speedMph, headingDeg, mode, netKind, rssi?, csq? }`
+  - `config`: `{ home: {lat, lon}, geofence: {innerFt, outerFt}, forceRoamUntil, wifiRssiMin, ping: {homeSec, nearbySec, roamingSec}, batteryUploadThreshold }`
+  - `counters`: `{ monthStart: <YYYY-MM-01>, monthBytes, monthPoints }`
+- `devices/{deviceId}/points/{autoId}`: `{ lat, lon, ts, battery, sats, hdop, speedMph, headingDeg, mode, createdAt }`
+
+## Functions (v2, us-central1)
+- Auth header required: `X-Device-Token: <DEVICE_TOKEN>`.
+- POST `/ingest`: accepts single point or `{ points: [] }` batch, applies defaults, updates `last`, appends to `points`, and maintains `counters`.
+- GET `/config?deviceId=...`: returns config with defaults applied plus counters/last snapshot.
 
 ## Setup
-1) Copy `public/firebase-config.js` and fill with your Firebase config (API key, project ID, etc.).
-2) Install Hosting + Functions deps:
+1) Fill `public/firebase-config.js` with your Firebase web config.
+2) Install deps and build functions:
    ```
    cd TrackerPortal/functions
    npm install
    npm run build
    ```
-3) (Optional) Use emulators:
+3) Set the ingest auth secret (used in process.env.DEVICE_TOKEN):
    ```
-   firebase emulators:start
+   firebase functions:secrets:set DEVICE_TOKEN
    ```
-4) Deploy when ready:
+4) Deploy:
    ```
    firebase deploy --only hosting,functions
    ```
-
-## Cloud Function ingest
-POST `/ingest` with JSON:
-```
-{
-  "deviceId": "dog-1",
-  "name": "Collar A",
-  "type": "dog",
-  "lat": 37.1,
-  "lon": -122.1,
-  "ts": 1700000000000,
-  "battery": 90,
-  "sats": 10,
-  "hdop": 1.2
-}
-```
-The function upserts `devices/{deviceId}`, sets `last`, updates `updatedAt`, and appends to `devices/{deviceId}/points`.
+5) Device firmware lives at `device/tsim7080g-s3` (LilyGo T-SIM7080G-S3). Fill `include/secrets.h`, then `pio run -t upload` from that folder.
 
 ## Notes
-- Project alias is set to `trackerportal` in `.firebaserc`; replace with your actual Firebase project ID before deploying.
-- Auth UI is built-in (email/password). An “Add device” button is present as an admin placeholder.
+- Project alias is set to `trackerportal` in `.firebaserc`; change to your Firebase project ID before deploying.
+- Auth UI is built-in (email/password).

@@ -307,6 +307,57 @@ a {
   gap: 8px;
 }
 
+.config-card .section-header {
+  margin-bottom: 10px;
+}
+
+.config-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.config-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.config-grid input {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  color: var(--text);
+  padding: 10px;
+  border-radius: 10px;
+}
+
+.config-actions {
+  margin-top: 12px;
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.timeline-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.timeline-row input[type="range"] {
+  width: 100%;
+  accent-color: var(--accent-strong);
+}
+
+.day-nav {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .btn.ghost {
   background: transparent;
   border-color: rgba(148, 163, 184, 0.4);
