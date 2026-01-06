@@ -14,12 +14,40 @@
 #define SerialMon Serial
 #define SerialAT Serial1
 
-#define TINY_GSM_MODEM_SIM7080
 #include <TinyGsmClient.h>
 
 #define ANSI_GREEN "\x1b[32m"
 #define ANSI_CYAN "\x1b[36m"
 #define ANSI_RESET "\x1b[0m"
+
+
+
+#define MODEM_RX 4
+#define MODEM_TX 5
+
+HardwareSerial SerialAT(1);
+
+void atsetup() {
+  Serial.begin(115200);
+  delay(3000);
+  Serial.println("AT passthrough ready");
+  Serial.println("Type AT commands and press Enter");
+
+  SerialAT.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
+}
+
+void atloop() {
+  // PC -> Modem
+  while (Serial.available()) {
+    SerialAT.write(Serial.read());
+  }
+
+  // Modem -> PC
+  while (SerialAT.available()) {
+    Serial.write(SerialAT.read());
+  }
+}
+
 
 #if ENABLE_AT_DEBUG
 #include <StreamDebugger.h>
@@ -41,7 +69,7 @@ TinyGsm modem(SerialAT);
 //  - HTTP status: 200/204
 
 TinyGsmClient netClient(modem, 0);
-TinyGsmClientSecure tlsClient(modem, 0);
+TinyGsmClientSecure tlsClient(modem, 1);
 XPowersPMU pmu;
 
 struct FixPayload
@@ -91,6 +119,119 @@ int readBatteryPercent()
 bool readChargingStatus()
 {
     return pmu.isCharging();
+}
+
+// Forward declaration for DNS check used in helper below.
+bool dnsCheck(const char *host);
+bool configureTlsProfile(uint8_t ctx, const char *host);
+
+bool setDnsServers(const char *primary, const char *secondary)
+{
+    String resp;
+    String cmd = String("+CDNSCFG=\"") + primary + "\"";
+    if (secondary && *secondary)
+    {
+        cmd += ",\"";
+        cmd += secondary;
+        cmd += "\"";
+    }
+    SerialMon.print("AT");
+    SerialMon.println(cmd);
+    modem.sendAT(cmd);
+    int8_t r = modem.waitResponse(5000, resp);
+    SerialMon.print("CDNSCFG resp: ");
+    SerialMon.println(resp);
+    return r == 1 && resp.indexOf("ERROR") < 0;
+}
+
+bool setClockToCompileTime()
+{
+    // Use build time as a fallback clock source for TLS validity checks.
+    const char *buildDate = __DATE__; // "Mmm dd yyyy"
+    const char *buildTime = __TIME__; // "HH:MM:SS"
+
+    char monthStr[4] = {0};
+    int day = 0, year = 0, hour = 0, minute = 0, second = 0;
+    sscanf(buildDate, "%3s %d %d", monthStr, &day, &year);
+    sscanf(buildTime, "%d:%d:%d", &hour, &minute, &second);
+
+    const char *months = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    const char *m = strstr(months, monthStr);
+    int month = m ? static_cast<int>((m - months) / 3 + 1) : 1;
+
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%02d/%02d/%02d,%02d:%02d:%02d+00",
+             year % 100, month, day, hour, minute, second);
+
+    String cmd = String("+CCLK=\"") + buf + "\"";
+    modem.sendAT(cmd);
+    bool ok = modem.waitResponse(2000) == 1;
+    SerialMon.print("Set clock from build time: ");
+    SerialMon.println(buf);
+    SerialMon.println(ok ? "CCLK set OK" : "CCLK set failed");
+    return ok;
+}
+
+bool setClockFromGnss(int year, int month, int day, int hour, int minute, int second)
+{
+    if (year < 2000 || year > 2099 || month < 1 || month > 12 || day < 1 || day > 31)
+    {
+        SerialMon.println("GNSS time invalid; skipping CCLK set.");
+        return false;
+    }
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%02d/%02d/%02d,%02d:%02d:%02d+00",
+             year % 100, month, day, hour, minute, second);
+    String cmd = String("+CCLK=\"") + buf + "\"";
+    modem.sendAT(cmd);
+    bool ok = modem.waitResponse(2000) == 1;
+    SerialMon.print("Set clock from GNSS: ");
+    SerialMon.println(buf);
+    SerialMon.println(ok ? "CCLK set OK" : "CCLK set failed");
+    return ok;
+}
+
+bool setApnForBearer0()
+{
+    String resp;
+
+    String cmd = String("+CGDCONT=1,\"IP\",\"") + APN + "\"";
+    SerialMon.print("AT");
+    SerialMon.println(cmd);
+    modem.sendAT(cmd);
+    int8_t r = modem.waitResponse(5000, resp);
+    SerialMon.print("CGDCONT resp: ");
+    SerialMon.println(resp);
+    if (r != 1)
+    {
+        SerialMon.println("Failed to set CGDCONT(1) APN.");
+        return false;
+    }
+
+    resp = "";
+    cmd = String("+CNCFG=0,1,\"") + APN + "\"";
+    SerialMon.print("AT");
+    SerialMon.println(cmd);
+    modem.sendAT(cmd);
+    r = modem.waitResponse(5000, resp);
+    SerialMon.print("CNCFG resp: ");
+    SerialMon.println(resp);
+    if (r != 1)
+    {
+        SerialMon.println("Failed to set CNCFG(0,1) APN.");
+        return false;
+    }
+
+    SerialMon.println("APN set on CGDCONT(1) and CNCFG(0,1).");
+    return true;
+}
+
+void flushSerialATInput()
+{
+    while (SerialAT.available())
+    {
+        SerialAT.read();
+    }
 }
 
 void printModeHeader(const char *label, const char *color)
@@ -169,10 +310,11 @@ bool sendIngestIfReady()
         return false;
     }
 
-    const char *host = "us-central1-wurdemaniot.cloudfunctions.net";
+    const char *host = "ingest-dwoseol4ba-uc.a.run.app";
     const uint16_t port = 443;
-    const char *path = "/ingest";
+    const char *path = "/";
 
+    configureTlsProfile(1, host);
     if (!tlsClient.connect(host, port))
     {
         SerialMon.println("TLS connect failed.");
@@ -482,6 +624,67 @@ int readRegStatus()
     return -1;
 }
 
+void logClock()
+{
+    String resp;
+    modem.sendAT("+CCLK?");
+    modem.waitResponse(2000, resp);
+    SerialMon.print("AT+CCLK?: ");
+    SerialMon.println(resp);
+}
+
+void printModemIds()
+{
+    String resp;
+    modem.sendAT("I");
+    modem.waitResponse(2000, resp);
+    SerialMon.print("ATI: ");
+    SerialMon.println(resp);
+
+    resp = "";
+    modem.sendAT("+GMR");
+    modem.waitResponse(2000, resp);
+    SerialMon.print("AT+GMR: ");
+    SerialMon.println(resp);
+}
+
+void logDnsConfig()
+{
+    String resp;
+    modem.sendAT("+CDNSCFG?");
+    modem.waitResponse(5000, resp);
+    SerialMon.print("CDNSCFG?: ");
+    SerialMon.println(resp);
+}
+
+bool applyDnsAndTest(const char *primary, const char *secondary, const char *testHost)
+{
+    SerialMon.printf("Applying DNS: %s / %s\n", primary, secondary ? secondary : "(none)");
+    if (!setDnsServers(primary, secondary))
+    {
+        SerialMon.println("Failed to set DNS servers.");
+        return false;
+    }
+    logDnsConfig();
+    SerialMon.printf("Test DNS lookup for %s after setting DNS...\n", testHost);
+    return dnsCheck(testHost);
+}
+
+bool configureTlsProfile(uint8_t ctx, const char *host)
+{
+    String resp;
+    modem.sendAT("+CSSLCFG=\"SSLVERSION\",", ctx, ",3");
+    int8_t r1 = modem.waitResponse(2000, resp);
+    resp = "";
+    modem.sendAT("+CSSLCFG=\"SNI\",", ctx, ",\"", host, "\"");
+    int8_t r2 = modem.waitResponse(2000, resp);
+    SerialMon.printf("TLS cfg ctx=%u host=%s sslver=%s sni=%s\n",
+                     ctx, host,
+                     (r1 == 1) ? "ok" : "fail",
+                     (r2 == 1) ? "ok" : "fail");
+    return r1 == 1 && r2 == 1;
+}
+
 
 bool waitForRegistration()
 {
@@ -642,7 +845,7 @@ bool activateCid0(String &ipOut)
 {
     ipOut = "";
 
-    // Ensure we’re attached
+    // 1) Ensure attached
     SerialMon.println("AT+CGATT=1");
     modem.sendAT("+CGATT=1");
     if (modem.waitResponse(15000) != 1) {
@@ -650,7 +853,7 @@ bool activateCid0(String &ipOut)
         return false;
     }
 
-    // Activate bearer 0
+    // 2) Activate PDP context 0
     SerialMon.println("AT+CNACT=0,1");
     modem.sendAT("+CNACT=0,1");
     if (modem.waitResponse(20000) != 1) {
@@ -658,7 +861,19 @@ bool activateCid0(String &ipOut)
         return false;
     }
 
-    // Query bearer state and parse the IP for CID0
+    // 3) 🔑 BIND DNS ENGINE TO PDP 0 (THIS WAS MISSING)
+    SerialMon.println("Binding DNS to PDP 0");
+    modem.sendAT("+CDNSPDPID=0");
+    if (modem.waitResponse(5000) != 1) {
+        SerialMon.println("CDNSPDPID failed");
+        return false;
+    }
+
+    // 4) Use network-provided DNS (recommended for Hologram/Verizon)
+    modem.sendAT("+CDNSCFG=0,0");
+    modem.waitResponse(5000);
+
+    // 5) Query bearer state
     String resp;
     modem.sendAT("+CNACT?");
     modem.waitResponse(5000, resp);
@@ -666,22 +881,7 @@ bool activateCid0(String &ipOut)
     SerialMon.print("CNACT?: ");
     SerialMon.println(resp);
 
-    // Example: +CNACT: 0,1,"10.123.45.67"
-    int cid = -1;
-    int state = 0;
-    char ip[32] = {0};
-
-    // Parse line for CID0
-    if (sscanf(resp.c_str(), "+CNACT: %d,%d,\"%31[^\"]\"", &cid, &state, ip) >= 2) {
-        if (cid == 0 && state == 1 && strlen(ip) > 0) {
-            ipOut = ip;
-            SerialMon.print("CID0 active. IP: ");
-            SerialMon.println(ipOut);
-            return true;
-        }
-    }
-
-    // If resp contains multiple lines, scan manually for "+CNACT: 0,1,"
+    // Parse IP for CID0
     int idx = resp.indexOf("+CNACT: 0,1,");
     if (idx >= 0) {
         int q1 = resp.indexOf('"', idx);
@@ -694,9 +894,10 @@ bool activateCid0(String &ipOut)
         }
     }
 
-    SerialMon.println("CID0 not active after CNACT. Check CNACT output above.");
+    SerialMon.println("CID0 not active after CNACT");
     return false;
 }
+
 
 
 void deactivateCid0()
@@ -720,28 +921,85 @@ void deactivateCid0()
     SerialMon.printf("CGATT after deactivate: %d\n", state);
 }
 
+bool sendCommandWaitForUrc(const String &cmd, const char *token, uint32_t timeoutMs, String &rawOut)
+{
+    rawOut = "";
+    flushSerialATInput();
+    SerialAT.flush();
+
+    SerialAT.print("AT");
+    SerialAT.println(cmd);
+
+    unsigned long start = millis();
+    unsigned long lastRead = start;
+    bool tokenSeen = false;
+
+    while (millis() - start < timeoutMs)
+    {
+        while (SerialAT.available())
+        {
+            char c = SerialAT.read();
+            rawOut += c;
+            lastRead = millis();
+            if (!tokenSeen && rawOut.indexOf(token) >= 0)
+            {
+                tokenSeen = true;
+            }
+        }
+
+        if (tokenSeen && millis() - lastRead > 200)
+        {
+            break; // token seen and input quiet for a short window
+        }
+        delay(10);
+    }
+
+    return tokenSeen;
+}
+
 bool dnsCheck(const char *host)
 {
-    String resp;
-    modem.sendAT("+CDNSGIP=\"", host, "\"");
-    modem.waitResponse(10000, resp);
-    SerialMon.print("DNS response: ");
-    SerialMon.println(resp);
+    String raw;
+    String cmd = String("+CDNSGIP=\"") + host + "\"";
+    SerialMon.print("Issuing DNS: AT");
+    SerialMon.println(cmd);
+    bool found = sendCommandWaitForUrc(cmd, "+CDNSGIP:", 60000, raw);
+    SerialMon.print("DNS raw: ");
+    SerialMon.println(raw);
 
-    bool ok = resp.indexOf("+CDNSGIP:") >= 0 && resp.indexOf("ERROR") < 0;
+    int errCode = -1;
+    int idx = raw.indexOf("+CDNSGIP:");
+    if (idx >= 0)
+    {
+        sscanf(raw.c_str() + idx, "+CDNSGIP: %*d,%d", &errCode);
+    }
+
+    bool hasResult = raw.indexOf("0,0,0,0") < 0 && (raw.indexOf('.') >= 0 || raw.indexOf("\",\"") >= 0);
+    bool ok = found && raw.indexOf("ERROR") < 0 && hasResult;
+    SerialMon.printf("DNS status: %s (err=%d)\n", ok ? "ok" : "failed", errCode);
+
+    if (!ok)
+    {
+        String altRaw;
+        SerialMon.println("DNS retry with google.com for comparison...");
+        sendCommandWaitForUrc("+CDNSGIP=\"google.com\"", "+CDNSGIP:", 30000, altRaw);
+        SerialMon.print("DNS raw (google.com): ");
+        SerialMon.println(altRaw);
+    }
+
     SerialMon.println(ok ? "DNS ok" : "DNS failed");
     return ok;
 }
 
 bool pingCheck()
 {
-    String resp;
-    modem.sendAT("+SNPING4=\"8.8.8.8\",1,16,1000");
-    modem.waitResponse(10000, resp);
-    SerialMon.print("Ping response: ");
-    SerialMon.println(resp);
+    String raw;
+    String cmd = "+SNPING4=\"8.8.8.8\",1,16,1000";
+    bool found = sendCommandWaitForUrc(cmd, "+SNPING4:", 20000, raw);
+    SerialMon.print("Ping raw: ");
+    SerialMon.println(raw);
 
-    bool ok = resp.indexOf("+SNPING4:") >= 0 && resp.indexOf("timeout") < 0 && resp.indexOf("ERROR") < 0;
+    bool ok = found && raw.indexOf("timeout") < 0 && raw.indexOf("ERROR") < 0;
     SerialMon.println(ok ? "Ping ok" : "Ping failed");
     return ok;
 }
@@ -749,9 +1007,64 @@ bool pingCheck()
 bool tlsConnectTest(const char *host, uint16_t port)
 {
     SerialMon.printf("TLS test connect to %s:%u...\n", host, port);
+    configureTlsProfile(1, host);
     bool ok = tlsClient.connect(host, port);
     SerialMon.println(ok ? "TLS connect ok" : "TLS connect failed");
     tlsClient.stop();
+    return ok;
+}
+
+bool httpsLogoTest()
+{
+    const char *host = "vsh.pp.ua";
+    const uint16_t port = 443;
+    const char *path = "/TinyGSM/logo.txt";
+
+    configureTlsProfile(1, host);
+
+    SerialMon.println("HTTPS logo test...");
+    if (!tlsClient.connect(host, port))
+    {
+        SerialMon.println("HTTPS logo test: connect failed");
+        return false;
+    }
+
+    tlsClient.print("GET ");
+    tlsClient.print(path);
+    tlsClient.print(" HTTP/1.1\r\nHost: ");
+    tlsClient.print(host);
+    tlsClient.print("\r\nConnection: close\r\n\r\n");
+
+    bool ok = false;
+    String line;
+    unsigned long start = millis();
+    while (millis() - start < 10000UL)
+    {
+        while (tlsClient.available())
+        {
+            char c = tlsClient.read();
+            if (c == '\n')
+            {
+                if (line.startsWith("HTTP/1.1 200") || line.startsWith("HTTP/1.0 200"))
+                {
+                    ok = true;
+                }
+                line = "";
+                start = millis();
+            }
+            else if (c != '\r')
+            {
+                line += c;
+            }
+        }
+        if (!tlsClient.connected())
+        {
+            break;
+        }
+        delay(10);
+    }
+    tlsClient.stop();
+    SerialMon.println(ok ? "HTTPS logo test ok" : "HTTPS logo test failed");
     return ok;
 }
 
@@ -776,6 +1089,14 @@ void runCellularCycle()
         return;
 
     printSignalAndReg();
+    logDnsConfig();
+    logClock();
+
+    if (!setApnForBearer0())
+    {
+        logHint("Failed to set APN.");
+        return;
+    }
 
     String ip;
     if (!activateCid0(ip))
@@ -784,10 +1105,15 @@ void runCellularCycle()
         return;
     }
 
-    const char *ingestHost = "us-central1-wurdemaniot.cloudfunctions.net";
+    // Always set carrier-agnostic public DNS (Cloudflare / Google) since auto-provisioning is not guaranteed.
+    applyDnsAndTest("1.1.1.1", "8.8.8.8", "google.com");
+
+    const char *ingestHost = "ingest-dwoseol4ba-uc.a.run.app";
     dnsCheck(ingestHost);
     pingCheck();
-    tlsConnectTest("www.google.com", 443);
+    httpsLogoTest();
+    configureTlsProfile(1, ingestHost);
+    tlsConnectTest("ingest-dwoseol4ba-uc.a.run.app", 443);
 
     if (!lastFix.hasFix)
     {
@@ -846,6 +1172,7 @@ void runGnssCycle()
             lastFix.hdop = hdop;
             lastFix.sats = usat;
             lastFix.tsMs = toEpochMs(year, month, day, hour, minute, second);
+            setClockFromGnss(year, month, day, hour, minute, second);
 
             double dist = distanceMeters(lat, lon, HOME_LAT, HOME_LON);
             TrackerMode newMode = TrackerMode::Home;
@@ -901,6 +1228,17 @@ void setup()
     if (!waitForModem())
     {
         logHint("Modem did not respond to AT. Check UART pins or power rails.");
+    }
+    else
+    {
+        printModemIds();
+        setClockToCompileTime();
+        modem.sendAT("+CTZU=0");
+        modem.waitResponse(2000);
+        SerialMon.println("Auto time update (CTZU) disabled to keep GNSS time.");
+        modem.sendAT("+CLTS=0");
+        modem.waitResponse(2000);
+        SerialMon.println("Network time sync (CLTS) disabled to keep GNSS time.");
     }
 
     // SIM7080 secure client uses modem-side TLS; no CA loaded yet, so validation is effectively disabled.
