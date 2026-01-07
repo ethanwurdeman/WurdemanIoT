@@ -2,7 +2,10 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+
+#define TINY_GSM_MODEM_SIM7080
 #include <TinyGsmClient.h>
+
 #include <ArduinoJson.h>
 #include <SD.h>
 #include <SPI.h>
@@ -12,7 +15,7 @@
 
 #include "secrets.h"
 
-#define TINY_GSM_MODEM_SIM7080
+
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -92,6 +95,7 @@ void loadQueue();
 double distanceFeet(double lat1, double lon1, double lat2, double lon2);
 String modeToString(TrackerMode m);
 void logStatus(const Point &pt, double distanceFt);
+uint64_t toEpochMs(int year, int month, int day, int hour, int minute, int second);
 
 int batteryPercent() {
   int pct = modem.getBattPercent();
@@ -239,10 +243,12 @@ void disconnectWifi() {
 
 bool wifiHasInternet() {
   if (WiFi.status() != WL_CONNECTED) return false;
+
   HTTPClient http;
   http.setTimeout(4000);
+
   String url = String(INGEST_BASE_URL) + "/config?deviceId=" + DEVICE_ID + "&ping=1";
-  if (!http.begin(wifiClient, url)) {
+  if (!http.begin(url)) {
     return false;
   }
   int code = http.sendRequest("HEAD");
@@ -295,7 +301,7 @@ bool fetchConfig(bool allowCellFallback) {
   if (!usedWifi && usedCell) {
     modemClient.setTimeout(15000);
   }
-  if (!http.begin(*client, url)) {
+  if (!http.begin(url)) {
     SerialMon.println("HTTP begin failed for config.");
     return false;
   }
@@ -305,25 +311,42 @@ bool fetchConfig(bool allowCellFallback) {
     DynamicJsonDocument doc(1024);
     DeserializationError err = deserializeJson(doc, http.getStream());
     if (!err) {
-      auto cfg = doc["config"];
-      currentConfig.innerFt = cfg["geofence"]["innerFt"] | currentConfig.innerFt;
-      currentConfig.outerFt = cfg["geofence"]["outerFt"] | currentConfig.outerFt;
-      if (cfg["home"]["lat"].is<double>() && cfg["home"]["lon"].is<double>()) {
-        currentConfig.homeLat = cfg["home"]["lat"].as<double>();
-        currentConfig.homeLon = cfg["home"]["lon"].as<double>();
-        currentConfig.hasHome = true;
-      }
-      currentConfig.wifiRssiMin = cfg["wifiRssiMin"] | currentConfig.wifiRssiMin;
-      currentConfig.pingHomeSec = cfg["ping"]["homeSec"] | currentConfig.pingHomeSec;
-      currentConfig.pingNearbySec = cfg["ping"]["nearbySec"] | currentConfig.pingNearbySec;
-      currentConfig.pingRoamingSec = cfg["ping"]["roamingSec"] | currentConfig.pingRoamingSec;
-      currentConfig.batteryUploadThreshold = cfg["batteryUploadThreshold"] | currentConfig.batteryUploadThreshold;
+      JsonObject cfg = doc["config"].as<JsonObject>();
+      if (!cfg.isNull()) {
+     JsonObject geofence = cfg["geofence"].as<JsonObject>();
+     if (!geofence.isNull()) {
+     currentConfig.innerFt = geofence["innerFt"] | currentConfig.innerFt;
+     currentConfig.outerFt = geofence["outerFt"] | currentConfig.outerFt;
+     }
+
+     JsonObject home = cfg["home"].as<JsonObject>();
+      if (!home.isNull() && home["lat"].is<double>() && home["lon"].is<double>()) {
+     currentConfig.homeLat = home["lat"].as<double>();
+      currentConfig.homeLon = home["lon"].as<double>();
+      currentConfig.hasHome = true;
+     }
+
+     currentConfig.wifiRssiMin = cfg["wifiRssiMin"] | currentConfig.wifiRssiMin;
+
+     JsonObject ping = cfg["ping"].as<JsonObject>();
+     if (!ping.isNull()) {
+     currentConfig.pingHomeSec   = ping["homeSec"]   | currentConfig.pingHomeSec;
+      currentConfig.pingNearbySec = ping["nearbySec"] | currentConfig.pingNearbySec;
+     currentConfig.pingRoamingSec= ping["roamingSec"]| currentConfig.pingRoamingSec;
+     }
+
+       currentConfig.batteryUploadThreshold =
+      cfg["batteryUploadThreshold"] | currentConfig.batteryUploadThreshold;
+
       if (cfg["forceRoamUntil"].is<int64_t>()) {
-        currentConfig.forceRoamUntilMs = cfg["forceRoamUntil"].as<int64_t>();
+        currentConfig.forceRoamUntilMs = (uint64_t)cfg["forceRoamUntil"].as<int64_t>();
       } else {
-        currentConfig.forceRoamUntilMs = 0;
-      }
+      currentConfig.forceRoamUntilMs = 0;
+    }
+
       SerialMon.println("Config updated from server.");
+    }
+
     } else {
       SerialMon.printf("Config JSON parse error: %s\n", err.c_str());
     }
@@ -406,21 +429,27 @@ String pointToJson(const Point &pt) {
   return json;
 }
 
-bool postJson(Client &client, const String &path, const String &body) {
+bool postJson(const String &path, const String &body) {
   HTTPClient http;
+  http.setTimeout(15000);
+
   String url = String(INGEST_BASE_URL) + path;
-  if (!http.begin(client, url)) {
+  if (!http.begin(url)) {
     SerialMon.println("HTTP begin failed.");
     return false;
   }
+
   http.addHeader("Content-Type", "application/json");
   http.addHeader("X-Device-Token", DEVICE_TOKEN);
+
   int code = http.POST(body);
+
   if (code > 0) {
     SerialMon.printf("POST %s -> %d\n", path.c_str(), code);
   } else {
     SerialMon.printf("POST %s failed: %s\n", path.c_str(), http.errorToString(code).c_str());
   }
+
   bool ok = code == HTTP_CODE_OK || code == HTTP_CODE_CREATED || code == HTTP_CODE_ACCEPTED || code == HTTP_CODE_NO_CONTENT;
   http.end();
   return ok;
@@ -435,7 +464,7 @@ bool postCurrentOverCell(const Point &pt) {
   body += "\",\"points\":[";
   body += pointToJson(pt);
   body += "]}";
-  bool ok = postJson(modemClient, "/ingest", body);
+bool ok = postJson("/ingest", body);
   if (ok && !unsent.empty()) {
     unsent.pop_back(); // remove the current point from queue
   }
@@ -468,7 +497,7 @@ bool postBatchOverWifi() {
     }
     body += "]}";
     wifiClient.setInsecure();
-    if (!postJson(wifiClient, "/ingest", body)) {
+    if (!postJson("/ingest", body)) {
       return false;
     }
     idx += chunk;
