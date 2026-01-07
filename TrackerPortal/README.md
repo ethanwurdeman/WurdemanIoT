@@ -42,7 +42,6 @@ Single-page Firebase Hosting app for the WurdemanIoT control center plus Cloud F
    ```
    firebase deploy --only hosting,functions
    ```
-5) Device firmware lives at `device/tsim7080g-s3` (LilyGo T-SIM7080G-S3). Fill `include/secrets.h`, then `pio run -t upload` from that folder.
 
 ## Notes
 - Project alias is set to `trackerportal` in `.firebaserc`; change to your Firebase project ID before deploying.

@@ -7,7 +7,7 @@ PlatformIO Arduino sketch for LilyGo T-SIM7080G-S3 (ESP32-S3 + SIM7080G + GNSS +
 2) Copy `include/secrets.h` and fill:
    - `WIFI_SSID` / `WIFI_PASS`
    - `DEVICE_ID` and `DEVICE_TOKEN` (must match Functions secret)
-   - `INGEST_BASE_URL` (e.g. `https://ingest-dwoseol4ba-uc.a.run.app`)
+   - `INGEST_BASE_URL` (e.g. `https://us-central1-wurdemaniot.cloudfunctions.net/ingest`)
    - `CELL_APN` credentials for your SIM
 3) Adjust pins if your board revision differs (see `MODEM_*` and `SD_CS_PIN` in `src/main.cpp`).
 
