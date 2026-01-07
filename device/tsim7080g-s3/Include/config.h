@@ -6,7 +6,7 @@ static const char *APN_USER   = "";
 static const char *APN_PASS   = "";
 
 // WiFi credentials for home network (optional)
-static const char *WIFI_SSID  = "Wurdeman Starlink 2.4";
+static const char *WIFI_SSID  = "WurdemanIoT";
 static const char *WIFI_PASS  = "Koda2024";
 
 // Serial settings
