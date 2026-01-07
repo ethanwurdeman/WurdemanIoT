@@ -52,7 +52,13 @@ const state = {
   historyWindowMinutes: DEFAULT_WINDOW_MINUTES,
   historyPoints: [],
   currentConfig: null,
-  lastSnapshot: null
+  lastSnapshot: null,
+  debug: {
+    deviceError: null,
+    devicesError: null,
+    historyError: null,
+    lastDeviceId: null
+  }
 };
 
 const routes = [
@@ -180,6 +186,7 @@ function renderComingSoon(label) {
 function renderHome() {
   cleanupListeners();
   const authNote = state.user ? "" : `<p class="muted">Viewing public data. Sign in to edit devices.</p>`;
+  const debugPanel = buildDebugPanel();
 
   view.innerHTML = `
     <div class="section-header">
@@ -191,6 +198,7 @@ function renderHome() {
       <button class="btn" type="button" id="add-device-btn">Add device (admin)</button>
     </div>
     <div id="device-grid" class="device-grid"></div>
+    ${debugPanel}
   `;
 
   const grid = document.getElementById("device-grid");
@@ -204,6 +212,8 @@ function renderHome() {
   state.unsubDevices = onSnapshot(
     q,
     (snap) => {
+      state.debug.devicesError = null;
+      updateDebugPanel();
       grid.innerHTML = "";
       if (snap.empty) {
         grid.innerHTML = `<div class="placeholder"><p class="muted">No devices yet.</p></div>`;
@@ -217,9 +227,13 @@ function renderHome() {
     },
     (err) => {
       console.error("Device load error", err);
+      state.debug.devicesError = err?.message || String(err);
+      updateDebugPanel();
       grid.innerHTML = `<div class="placeholder"><p class="muted">Error loading devices: ${err.message}</p></div>`;
     }
   );
+
+  updateDebugPanel();
 }
 
 function buildDeviceCard(id, data) {
@@ -272,7 +286,11 @@ function renderDog(deviceId, label = "Dog") {
   state.timelineCursorMin = minutesSinceMidnight(new Date());
   state.historyWindowMinutes = DEFAULT_WINDOW_MINUTES;
   state.historyPoints = [];
+  state.debug.deviceError = null;
+  state.debug.historyError = null;
+  state.debug.lastDeviceId = deviceId;
   const authNote = state.user ? "" : `<p class="muted">Viewing public data. Sign in to edit settings.</p>`;
+  const debugPanel = buildDebugPanel();
 
   view.innerHTML = `
     <div class="section-header">
@@ -372,6 +390,7 @@ function renderDog(deviceId, label = "Dog") {
       </div>
       <div class="history-meta" id="history-meta">Loading history...</div>
     </div>
+    ${debugPanel}
   `;
 
   initMap();
@@ -380,6 +399,8 @@ function renderDog(deviceId, label = "Dog") {
   subscribeDevice(deviceId);
   loadHistory(deviceId, state.selectedDay);
   state.historyTimer = setInterval(() => loadHistory(deviceId, state.selectedDay), 30000);
+
+  updateDebugPanel();
 }
 
 function bindConfigHandlers(deviceId) {
@@ -437,14 +458,20 @@ function subscribeDevice(deviceId) {
     ref,
     (snap) => {
       if (!snap.exists()) {
+        state.debug.deviceError = "Device doc not found";
+        updateDebugPanel();
         view.innerHTML = `<div class="placeholder"><h2>Device not found</h2><p class="muted">${deviceId}</p></div>`;
         return;
       }
+      state.debug.deviceError = null;
+      updateDebugPanel();
       const data = snap.data();
       updateDogUI(deviceId, data);
     },
     (err) => {
       console.error("Device listener error", err);
+      state.debug.deviceError = err?.message || String(err);
+      updateDebugPanel();
       const meta = document.getElementById("history-meta");
       if (meta) meta.textContent = `Error: ${err.message}`;
     }
@@ -468,6 +495,8 @@ async function loadHistory(deviceId, day = state.selectedDay || startOfDay(new D
       limit(HISTORY_LIMIT)
     );
     const snap = await getDocs(q);
+    state.debug.historyError = null;
+    updateDebugPanel();
     const points = [];
     snap.forEach((docSnap) => {
       const d = docSnap.data();
@@ -487,6 +516,8 @@ async function loadHistory(deviceId, day = state.selectedDay || startOfDay(new D
       : "No history points for this day.";
   } catch (err) {
     console.error("History load error", err);
+    state.debug.historyError = err?.message || String(err);
+    updateDebugPanel();
     histMeta.textContent = `History error: ${err.message}`;
   }
 }
@@ -601,6 +632,8 @@ function updateDogUI(deviceId, data) {
       state.map.setView(pos, 15);
     }
   }
+
+  updateDebugPanel();
 }
 
 function updateModeUI(deviceId, data, config) {
@@ -998,5 +1031,66 @@ function cleanupListeners() {
   state.timelineCursorMin = minutesSinceMidnight(new Date());
   state.currentConfig = null;
   state.lastSnapshot = null;
+  state.debug.deviceError = null;
+  state.debug.devicesError = null;
+  state.debug.historyError = null;
+  state.debug.lastDeviceId = null;
+}
+
+function buildDebugPanel() {
+  return `
+    <div class="card" id="debug-panel">
+      <div class="section-header">
+        <h3>Debug</h3>
+        <span class="pill" id="debug-auth-pill"><span class="dot"></span>Auth: -</span>
+      </div>
+      <div class="meta">
+        <span>Project: ${firebaseConfig?.projectId || "-"}</span>
+        <span>Device ID: ${state.debug.lastDeviceId || defaultDeviceId || "-"}</span>
+        <span>Devices error: <span id="debug-devices-error">-</span></span>
+        <span>Device error: <span id="debug-device-error">-</span></span>
+        <span>History error: <span id="debug-history-error">-</span></span>
+      </div>
+      <div class="meta">
+        <span>Last update: <span id="debug-last-update">-</span></span>
+        <span>Last lat/lon: <span id="debug-last-coords">-</span></span>
+        <span>Points today: <span id="debug-history-count">-</span></span>
+      </div>
+    </div>
+  `;
+}
+
+function updateDebugPanel() {
+  const panel = document.getElementById("debug-panel");
+  if (!panel) return;
+
+  const authPill = document.getElementById("debug-auth-pill");
+  if (authPill) {
+    const authed = !!state.user;
+    authPill.className = `pill ${authed ? "online" : "stale"}`;
+    authPill.innerHTML = `<span class="dot"></span>Auth: ${authed ? "signed-in" : "public"}`;
+  }
+
+  const devicesErr = document.getElementById("debug-devices-error");
+  if (devicesErr) devicesErr.textContent = state.debug.devicesError || "-";
+  const deviceErr = document.getElementById("debug-device-error");
+  if (deviceErr) deviceErr.textContent = state.debug.deviceError || "-";
+  const historyErr = document.getElementById("debug-history-error");
+  if (historyErr) historyErr.textContent = state.debug.historyError || "-";
+
+  const last = state.lastSnapshot?.last;
+  const lastUpdate = toDate(last?.ts) || toDate(state.lastSnapshot?.updatedAt);
+  const lastUpdateEl = document.getElementById("debug-last-update");
+  if (lastUpdateEl) lastUpdateEl.textContent = lastUpdate ? formatDate(lastUpdate) : "-";
+
+  const coordsEl = document.getElementById("debug-last-coords");
+  if (coordsEl && last?.lat != null && last?.lon != null) {
+    coordsEl.textContent = `${Number(last.lat).toFixed(5)}, ${Number(last.lon).toFixed(5)}`;
+  } else if (coordsEl) {
+    coordsEl.textContent = "-";
+  }
+
+  const historyCountEl = document.getElementById("debug-history-count");
+  if (historyCountEl) historyCountEl.textContent = String(state.historyPoints?.length || 0);
 }
 
