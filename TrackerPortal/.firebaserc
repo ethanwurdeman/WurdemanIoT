@@ -1,5 +1,8 @@
 {
   "projects": {
-    "default": "wurdemaniot"
-  }
+    "default": "wurdemaniot",
+    "Ethan": "wurdemaniot"
+  },
+  "targets": {},
+  "etags": {}
 }

@@ -23,6 +23,8 @@ Single-page Firebase Hosting app for the WurdemanIoT control center plus Cloud F
 
 ## Functions (v2, us-central1)
 - Auth header required: `X-Device-Token: <DEVICE_TOKEN>`.
+- Ingest endpoint: `https://us-central1-wurdemaniot.cloudfunctions.net/ingest`
+- Device token (Tyee): `b7c9e2a41fd64e7d9f13c8a5`
 - POST `/ingest`: accepts single point or `{ points: [] }` batch, applies defaults, updates `last`, appends to `points`, and maintains `counters`.
 - GET `/config?deviceId=...`: returns config with defaults applied plus counters/last snapshot.
 

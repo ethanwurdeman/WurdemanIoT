@@ -19,7 +19,7 @@ import {
   startAt,
   Timestamp
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
-import { firebaseConfig } from "./firebase-config.js";
+import { firebaseConfig, ingestConfig } from "./firebase-config.js";
 
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
@@ -71,8 +71,9 @@ const authEmail = document.getElementById("auth-email");
 const authPassword = document.getElementById("auth-password");
 const petsLink = document.getElementById("pets-link");
 
+const defaultDeviceId = ingestConfig?.deviceId || "Tyee";
 if (petsLink) {
-  petsLink.href = "#/pet/Tyee";
+  petsLink.href = `#/pet/${defaultDeviceId}`;
 }
 
 authForm.addEventListener("submit", async (e) => {
@@ -128,11 +129,6 @@ function updateAuthUI() {
 function router() {
   const path = (window.location.hash.replace(/^#/, "") || "/home").replace(/\/+$/, "") || "/home";
 
-  if (!state.user) {
-    renderAuthGate();
-    return;
-  }
-
   for (const r of routes) {
     const match = path.match(r.pattern);
     if (match) {
@@ -142,6 +138,13 @@ function router() {
   }
 
   renderNotFound();
+}
+
+function requireAuth(actionLabel) {
+  if (state.user) return true;
+  const meta = document.getElementById("history-meta");
+  if (meta) meta.textContent = `Sign in required to ${actionLabel}.`;
+  return false;
 }
 
 function renderAuthGate() {
@@ -176,12 +179,14 @@ function renderComingSoon(label) {
 
 function renderHome() {
   cleanupListeners();
+  const authNote = state.user ? "" : `<p class="muted">Viewing public data. Sign in to edit devices.</p>`;
 
   view.innerHTML = `
     <div class="section-header">
       <div>
         <h1>Devices</h1>
         <p class="muted">Live status from Firestore</p>
+        ${authNote}
       </div>
       <button class="btn" type="button" id="add-device-btn">Add device (admin)</button>
     </div>
@@ -189,6 +194,11 @@ function renderHome() {
   `;
 
   const grid = document.getElementById("device-grid");
+  const addBtn = document.getElementById("add-device-btn");
+  if (addBtn && !state.user) {
+    addBtn.disabled = true;
+    addBtn.title = "Sign in required.";
+  }
   const q = query(collection(db, "devices"), orderBy("updatedAt", "desc"));
 
   state.unsubDevices = onSnapshot(
@@ -262,6 +272,7 @@ function renderDog(deviceId, label = "Dog") {
   state.timelineCursorMin = minutesSinceMidnight(new Date());
   state.historyWindowMinutes = DEFAULT_WINDOW_MINUTES;
   state.historyPoints = [];
+  const authNote = state.user ? "" : `<p class="muted">Viewing public data. Sign in to edit settings.</p>`;
 
   view.innerHTML = `
     <div class="section-header">
@@ -269,6 +280,7 @@ function renderDog(deviceId, label = "Dog") {
         <a class="back-link" href="#/home">&larr; Back</a>
         <h2 id="dog-title">${label} tracker</h2>
         <p class="muted">Live location for <span id="dog-id">${deviceId}</span></p>
+        ${authNote}
       </div>
       <span class="pill online" id="dog-status"><span class="dot"></span>Online</span>
     </div>
@@ -373,10 +385,14 @@ function renderDog(deviceId, label = "Dog") {
 function bindConfigHandlers(deviceId) {
   const saveBtn = document.getElementById("save-config-btn");
   if (saveBtn) {
+    saveBtn.disabled = !state.user;
+    saveBtn.title = state.user ? "" : "Sign in required.";
     saveBtn.onclick = () => saveConfig(deviceId);
   }
   const setHomeBtn = document.getElementById("set-home-btn");
   if (setHomeBtn) {
+    setHomeBtn.disabled = !state.user;
+    setHomeBtn.title = state.user ? "" : "Sign in required.";
     setHomeBtn.onclick = () => setHomeToCurrent(deviceId);
   }
 }
@@ -592,6 +608,7 @@ function updateModeUI(deviceId, data, config) {
   const forcePill = document.getElementById("force-pill");
   const forceBtn = document.getElementById("force-roam-btn");
   const clearBtn = document.getElementById("clear-force-btn");
+  const canEdit = !!state.user;
 
   const forceUntil = toDate(config?.forceRoamUntil);
   const forceActive = isForceActive(config?.forceRoamUntil);
@@ -611,16 +628,19 @@ function updateModeUI(deviceId, data, config) {
   }
 
   if (forceBtn) {
-    forceBtn.disabled = forceActive;
+    forceBtn.disabled = !canEdit || forceActive;
+    forceBtn.title = canEdit ? "" : "Sign in required.";
     forceBtn.onclick = () => setForceRoaming(deviceId, 20);
   }
   if (clearBtn) {
-    clearBtn.disabled = !forceActive && !config?.forceRoamUntil;
+    clearBtn.disabled = !canEdit || (!forceActive && !config?.forceRoamUntil);
+    clearBtn.title = canEdit ? "" : "Sign in required.";
     clearBtn.onclick = () => clearForceRoaming(deviceId);
   }
 }
 
 async function setForceRoaming(deviceId, minutes) {
+  if (!requireAuth("force roaming")) return;
   const meta = document.getElementById("history-meta");
   if (meta) meta.textContent = "Enabling force roaming...";
   try {
@@ -638,6 +658,7 @@ async function setForceRoaming(deviceId, minutes) {
 }
 
 async function clearForceRoaming(deviceId) {
+  if (!requireAuth("clear overrides")) return;
   const meta = document.getElementById("history-meta");
   if (meta) meta.textContent = "Clearing override...";
   try {
@@ -654,6 +675,7 @@ async function clearForceRoaming(deviceId) {
 }
 
 async function saveConfig(deviceId) {
+  if (!requireAuth("save config")) return;
   const meta = document.getElementById("history-meta");
   if (meta) meta.textContent = "Saving config...";
   try {
@@ -667,6 +689,7 @@ async function saveConfig(deviceId) {
 }
 
 async function setHomeToCurrent(deviceId) {
+  if (!requireAuth("set home")) return;
   const meta = document.getElementById("history-meta");
   const last = state.lastSnapshot?.last;
   const lat = toNumber(last?.lat);
@@ -730,7 +753,8 @@ function updateConfigUI(config, last) {
   const setHomeBtn = document.getElementById("set-home-btn");
   if (setHomeBtn) {
     const hasLast = Number.isFinite(toNumber(last?.lat)) && Number.isFinite(toNumber(last?.lon));
-    setHomeBtn.disabled = !hasLast;
+    setHomeBtn.disabled = !state.user || !hasLast;
+    setHomeBtn.title = state.user ? "" : "Sign in required.";
   }
 
   const entries = [
