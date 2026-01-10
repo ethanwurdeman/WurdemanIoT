@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <Preferences.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
@@ -12,6 +13,13 @@
 // === User config ===
 const char *WIFI_SSID     = "Wurdeman Starlink 2.4";
 const char *WIFI_PASSWORD = "Koda2020";
+const char *AUTHORIZED_SSID = "WurdemanIoT"; // network required for control changes
+const char *ADMIN_USER = "admin";
+const char *ADMIN_PASSWORD = "change-me";
+const char *AP_SSID = "Thermostat-Setup";
+const char *AP_PASSWORD = "";
+const char *HEADER_KEYS[] = {"Cookie"};
+const size_t HEADER_KEYS_COUNT = 1;
 
 // Pins (board labels)
 const int HEAT_PIN = D12; // heat relay output (moved from D5)
@@ -33,6 +41,9 @@ const bool RELAY_ACTIVE_HIGH = true;
 // Time config (seconds offset from UTC); defaults to 0, set dynamically from web client
 long tzOffsetSec = 0;
 int dstOffsetSec = 0;
+
+const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
+const unsigned long WIFI_RECONNECT_INTERVAL_MS = 30000;
 
 // Control defaults
 float setpointF = 70.0; // target temperature in Fahrenheit
@@ -69,6 +80,18 @@ bool displayReady = false;
 DHT dht(DHT_PIN, DHT22);
 
 WebServer server(80);
+Preferences prefs;
+
+String wifiSsid;
+String wifiPass;
+bool wifiConnected = false;
+bool apMode = false;
+String wifiIpStr = "0.0.0.0";
+unsigned long lastWifiReconnect = 0;
+
+String sessionToken;
+unsigned long sessionStartMs = 0;
+const unsigned long SESSION_TTL_MS = 12UL * 60UL * 60UL * 1000UL;
 
 // State
 bool heatOn = false;
@@ -124,6 +147,10 @@ void handleSystemStatusData();
 void handleSet();
 void handleStatus();
 void handleTz();
+void handleWifiPage();
+void handleWifiSave();
+void handleLogin();
+void handleLogout();
 void setOutput(int pin, bool on);
 void updateDisplay();
 void handleButtons();
@@ -132,6 +159,16 @@ void logHealth();
 void logSdCardInfo(const char* context);
 void sdWriteTest();
 const char* sdTypeToString(uint8_t type);
+void loadWifiCredentials();
+bool connectWiFiWithTimeout(unsigned long timeoutMs);
+void startWiFi();
+void startAp();
+void updateWiFiStatus();
+bool isAuthenticated();
+bool onAuthorizedNetwork();
+bool canControl();
+bool requireControlAuth();
+String makeToken();
 
 void setup() {
   Serial.begin(115200);
@@ -184,17 +221,9 @@ void setup() {
     Serial.println("SSD1306 init failed (check wiring/address)");
   }
 
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(300);
-    Serial.print(".");
-  }
-  Serial.println("\nWiFi connected");
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
-  configTime(tzOffsetSec, dstOffsetSec, "pool.ntp.org", "time.nist.gov", "time.google.com");
+  prefs.begin("wifi", false);
+  loadWifiCredentials();
+  startWiFi();
 
   // SD card init (using explicit SPI pins)
   SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
@@ -222,11 +251,18 @@ void setup() {
   server.on("/set", handleSet);
   server.on("/status", handleStatus);
   server.on("/tz", handleTz);
+  server.on("/wifi", HTTP_GET, handleWifiPage);
+  server.on("/wifi", HTTP_POST, handleWifiSave);
+  server.on("/login", HTTP_GET, handleLogin);
+  server.on("/login", HTTP_POST, handleLogin);
+  server.on("/logout", handleLogout);
+  server.collectHeaders(HEADER_KEYS, HEADER_KEYS_COUNT);
   server.begin();
 }
 
 void loop() {
   server.handleClient();
+  updateWiFiStatus();
 
   unsigned long now = millis();
   if (now - lastRead >= READ_INTERVAL_MS) {
@@ -394,6 +430,250 @@ void loop() {
   logHealth();
 }
 
+String makeToken() {
+  uint32_t a = esp_random();
+  uint32_t b = esp_random();
+  char buf[17];
+  snprintf(buf, sizeof(buf), "%08lx%08lx", (unsigned long)a, (unsigned long)b);
+  return String(buf);
+}
+
+bool isAuthenticated() {
+  if (sessionToken.length() == 0) return false;
+  if ((unsigned long)(millis() - sessionStartMs) >= SESSION_TTL_MS) return false;
+  String cookie = server.header("Cookie");
+  if (cookie.length() == 0) return false;
+  int idx = cookie.indexOf("session=");
+  if (idx < 0) return false;
+  int start = idx + 8;
+  int end = cookie.indexOf(';', start);
+  String value = (end < 0) ? cookie.substring(start) : cookie.substring(start, end);
+  value.trim();
+  return value == sessionToken;
+}
+
+bool onAuthorizedNetwork() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  if (AUTHORIZED_SSID[0] == '\0') return true;
+  return WiFi.SSID() == String(AUTHORIZED_SSID);
+}
+
+bool canControl() {
+  return isAuthenticated() && onAuthorizedNetwork();
+}
+
+bool requireControlAuth() {
+  if (canControl()) return true;
+  if (server.method() == HTTP_GET) {
+    server.sendHeader("Location", "/login");
+    server.send(302, "text/plain", "login required");
+  } else {
+    server.send(401, "text/plain", "unauthorized");
+  }
+  return false;
+}
+
+void loadWifiCredentials() {
+  wifiSsid = prefs.getString("ssid", WIFI_SSID);
+  wifiPass = prefs.getString("pass", WIFI_PASSWORD);
+}
+
+bool connectWiFiWithTimeout(unsigned long timeoutMs) {
+  if (wifiSsid.length() == 0) return false;
+  WiFi.mode(apMode ? WIFI_AP_STA : WIFI_STA);
+  WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - start) < timeoutMs) {
+    delay(300);
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnected = true;
+    apMode = false;
+    wifiIpStr = WiFi.localIP().toString();
+    WiFi.softAPdisconnect(true);
+    configTime(tzOffsetSec, dstOffsetSec, "pool.ntp.org", "time.nist.gov", "time.google.com");
+    Serial.printf("\nWiFi connected: %s (%s)\n", WiFi.SSID().c_str(), wifiIpStr.c_str());
+    return true;
+  }
+  wifiConnected = false;
+  return false;
+}
+
+void startWiFi() {
+  Serial.printf("Connecting to WiFi SSID: %s\n", wifiSsid.c_str());
+  if (!connectWiFiWithTimeout(WIFI_CONNECT_TIMEOUT_MS)) {
+    Serial.println("WiFi not connected; starting AP");
+    startAp();
+  }
+}
+
+void startAp() {
+  WiFi.mode(WIFI_AP_STA);
+  if (AP_PASSWORD[0] != '\0') {
+    WiFi.softAP(AP_SSID, AP_PASSWORD);
+  } else {
+    WiFi.softAP(AP_SSID);
+  }
+  apMode = true;
+  wifiIpStr = WiFi.softAPIP().toString();
+  Serial.printf("AP started: %s (IP %s)\n", AP_SSID, wifiIpStr.c_str());
+}
+
+void updateWiFiStatus() {
+  static unsigned long lastCheck = 0;
+  unsigned long now = millis();
+  if (now - lastCheck < 1000) return;
+  lastCheck = now;
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!wifiConnected) {
+      wifiConnected = true;
+      apMode = false;
+      wifiIpStr = WiFi.localIP().toString();
+      WiFi.softAPdisconnect(true);
+      configTime(tzOffsetSec, dstOffsetSec, "pool.ntp.org", "time.nist.gov", "time.google.com");
+      Serial.printf("WiFi reconnected: %s (%s)\n", WiFi.SSID().c_str(), wifiIpStr.c_str());
+    }
+    return;
+  }
+
+  if (wifiConnected) {
+    wifiConnected = false;
+    Serial.println("WiFi disconnected");
+  }
+  if (!apMode) startAp();
+  if (apMode) wifiIpStr = WiFi.softAPIP().toString();
+
+  if (wifiSsid.length() > 0 && (now - lastWifiReconnect) >= WIFI_RECONNECT_INTERVAL_MS) {
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+    lastWifiReconnect = now;
+  }
+}
+
+void handleLogin() {
+  String msg;
+  if (server.method() == HTTP_POST) {
+    String user = server.arg("user");
+    String pass = server.arg("pass");
+    if (user == ADMIN_USER && pass == ADMIN_PASSWORD) {
+      sessionToken = makeToken();
+      sessionStartMs = millis();
+      String cookie = "session=" + sessionToken + "; Path=/; HttpOnly; SameSite=Strict; Max-Age=" + String(SESSION_TTL_MS / 1000);
+      server.sendHeader("Set-Cookie", cookie);
+      server.sendHeader("Location", "/thermostat");
+      server.send(303, "text/plain", "signed in");
+      return;
+    }
+    msg = "Invalid credentials.";
+  }
+
+  bool signedIn = isAuthenticated();
+  bool onNet = onAuthorizedNetwork();
+  String netLabel = onNet ? "Authorized network" : "Not on authorized network";
+
+  String page;
+  page += F("<!doctype html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>");
+  page += F("<style>body{font-family:'Segoe UI',sans-serif;background:#0e1117;color:#e6e9f0;display:flex;justify-content:center;align-items:flex-start;min-height:100vh;padding:16px;} .card{background:#171b23;border-radius:18px;box-shadow:0 12px 30px rgba(0,0,0,0.45);width:460px;padding:20px;} h1{font-size:1.2rem;margin:0 0 8px;} .nav{display:flex;gap:10px;margin:8px 0 12px;} .nav a{background:#232a36;color:#e6e9f0;text-decoration:none;padding:8px 12px;border-radius:10px;box-shadow:0 6px 12px rgba(0,0,0,0.25);} .nav a.active{background:#2f74ff;} .pill{background:#232a36;border-radius:14px;padding:10px;display:flex;align-items:center;justify-content:space-between;margin:8px 0;} label{display:block;margin:6px 0 4px;} input{width:100%;padding:10px;border-radius:10px;border:1px solid #2b3442;background:#0f141c;color:#e6e9f0;} button{border:none;border-radius:10px;background:#2f74ff;color:#fff;padding:10px 14px;font-size:1rem;cursor:pointer;box-shadow:0 6px 12px rgba(0,0,0,0.25);width:100%;margin-top:10px;} .hint{color:#8a93a8;font-size:0.85rem;} a{color:#8fb3ff;} </style>");
+  page += F("</head><body><div class='card'>");
+  page += F("<div class='row'><h1>Sign In</h1><div></div></div>");
+  page += "<div class='nav'><a href='/thermostat'>Thermostat</a><a href='/schedule'>Schedule</a><a href='/history'>History</a><a href='/system_status'>System</a><a href='/wifi'>WiFi</a><a class='active' href='/login'>Sign in</a></div>";
+  page += "<div class='pill'><label>Status</label><div>" + String(signedIn ? "Signed in" : "Signed out") + " | " + netLabel + "</div></div>";
+  if (msg.length() > 0) {
+    page += "<div class='hint'>" + msg + "</div>";
+  }
+  if (signedIn) {
+    page += "<div class='pill'><label>Session</label><div><a href='/logout'>Sign out</a></div></div>";
+  }
+  page += F("<form method='POST' action='/login'>");
+  page += F("<label for='user'>User</label><input id='user' name='user' autocomplete='username' required>");
+  page += F("<label for='pass'>Password</label><input id='pass' name='pass' type='password' autocomplete='current-password' required>");
+  page += F("<button type='submit'>Sign in</button>");
+  page += F("</form>");
+  page += F("<div class='hint'>Only signed-in users on the authorized network can change settings.</div>");
+  page += F("</div></body></html>");
+  server.send(200, "text/html", page);
+}
+
+void handleLogout() {
+  sessionToken = "";
+  sessionStartMs = 0;
+  server.sendHeader("Set-Cookie", "session=; Max-Age=0; Path=/");
+  server.sendHeader("Location", "/thermostat");
+  server.send(303, "text/plain", "signed out");
+}
+
+void handleWifiPage() {
+  bool connected = (WiFi.status() == WL_CONNECTED);
+  bool allowEdit = !connected || canControl();
+  String modeLabel = connected ? "Connected" : (apMode ? "AP mode" : "Offline");
+  String ssidLabel = connected ? WiFi.SSID() : (apMode ? String(AP_SSID) : String(""));
+  String ipLabel = connected ? WiFi.localIP().toString() : (apMode ? WiFi.softAPIP().toString() : String("0.0.0.0"));
+
+  String page;
+  page += F("<!doctype html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>");
+  page += F("<style>body{font-family:'Segoe UI',sans-serif;background:#0e1117;color:#e6e9f0;display:flex;justify-content:center;align-items:flex-start;min-height:100vh;padding:16px;} .card{background:#171b23;border-radius:18px;box-shadow:0 12px 30px rgba(0,0,0,0.45);width:460px;padding:20px;} h1{font-size:1.2rem;margin:0 0 8px;} .nav{display:flex;gap:10px;margin:8px 0 12px;} .nav a{background:#232a36;color:#e6e9f0;text-decoration:none;padding:8px 12px;border-radius:10px;box-shadow:0 6px 12px rgba(0,0,0,0.25);} .nav a.active{background:#2f74ff;} .pill{background:#232a36;border-radius:14px;padding:10px;display:flex;align-items:center;justify-content:space-between;margin:8px 0;} label{display:block;margin:6px 0 4px;} input{width:100%;padding:10px;border-radius:10px;border:1px solid #2b3442;background:#0f141c;color:#e6e9f0;} button{border:none;border-radius:10px;background:#2f74ff;color:#fff;padding:10px 14px;font-size:1rem;cursor:pointer;box-shadow:0 6px 12px rgba(0,0,0,0.25);width:100%;margin-top:10px;} button:disabled{opacity:0.6;cursor:not-allowed;} .hint{color:#8a93a8;font-size:0.85rem;} a{color:#8fb3ff;} </style>");
+  page += F("</head><body><div class='card'>");
+  page += F("<div class='row'><h1>WiFi Setup</h1><div></div></div>");
+  page += "<div class='nav'><a href='/thermostat'>Thermostat</a><a href='/schedule'>Schedule</a><a href='/history'>History</a><a href='/system_status'>System</a><a class='active' href='/wifi'>WiFi</a><a href='/login'>Sign in</a></div>";
+  page += "<div class='pill'><label>Status</label><div class='val'>" + modeLabel + "</div></div>";
+  if (ssidLabel.length() > 0) {
+    page += "<div class='pill'><label>SSID</label><div class='val'>" + ssidLabel + "</div></div>";
+  }
+  page += "<div class='pill'><label>IP</label><div class='val'>" + ipLabel + "</div></div>";
+  if (!allowEdit && connected) {
+    page += "<div class='hint'>Sign in on the authorized network to change WiFi settings.</div>";
+  } else if (!connected) {
+    page += "<div class='hint'>Connect to the AP and enter WiFi credentials to join your network.</div>";
+  }
+  page += F("<form method='POST' action='/wifi'>");
+  page += "<label for='ssid'>SSID</label><input id='ssid' name='ssid' value='" + wifiSsid + "'" + String(allowEdit ? "" : " disabled") + ">";
+  page += "<label for='pass'>Password</label><input id='pass' name='pass' type='password' value='' " + String(allowEdit ? "" : " disabled") + ">";
+  page += "<button type='submit'" + String(allowEdit ? "" : " disabled") + ">Save and connect</button>";
+  page += F("</form>");
+  page += F("<div class='hint'>Saved credentials persist across reboots.</div>");
+  page += F("</div></body></html>");
+  server.send(200, "text/html", page);
+}
+
+void handleWifiSave() {
+  if (wifiConnected && !canControl()) {
+    server.sendHeader("Location", "/login");
+    server.send(302, "text/plain", "login required");
+    return;
+  }
+  String ssid = server.arg("ssid");
+  String pass = server.arg("pass");
+  ssid.trim();
+  if (ssid.length() == 0) {
+    server.send(400, "text/plain", "ssid required");
+    return;
+  }
+  wifiSsid = ssid;
+  wifiPass = pass;
+  prefs.putString("ssid", wifiSsid);
+  prefs.putString("pass", wifiPass);
+
+  bool ok = connectWiFiWithTimeout(WIFI_CONNECT_TIMEOUT_MS);
+  if (!ok) startAp();
+  String targetIp = ok ? WiFi.localIP().toString() : (apMode ? WiFi.softAPIP().toString() : wifiIpStr);
+
+  String page;
+  page += F("<!doctype html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>");
+  page += F("<style>body{font-family:'Segoe UI',sans-serif;background:#0e1117;color:#e6e9f0;display:flex;justify-content:center;align-items:flex-start;min-height:100vh;padding:16px;} .card{background:#171b23;border-radius:18px;box-shadow:0 12px 30px rgba(0,0,0,0.45);width:460px;padding:20px;} h1{font-size:1.2rem;margin:0 0 8px;} .pill{background:#232a36;border-radius:14px;padding:10px;display:flex;align-items:center;justify-content:space-between;margin:8px 0;} a{color:#8fb3ff;} </style>");
+  page += F("</head><body><div class='card'>");
+  page += F("<div class='row'><h1>WiFi Update</h1><div></div></div>");
+  page += "<div class='pill'><label>Status</label><div class='val'>" + String(ok ? "Connected" : "Not connected") + "</div></div>";
+  page += "<div class='pill'><label>IP</label><div class='val'>" + targetIp + "</div></div>";
+  if (ok) {
+    page += "<div>Open <a href='http://" + targetIp + "/thermostat'>http://" + targetIp + "/thermostat</a></div>";
+  } else {
+    page += "<div>Stay on the AP and try again.</div>";
+  }
+  page += F("</div></body></html>");
+  server.send(200, "text/html", page);
+}
+
 void handleThermostat() {
   // Determine schedule/manual status for display
   String schedLabel = "Manual";
@@ -414,6 +694,21 @@ void handleThermostat() {
     }
   }
 
+  bool signedIn = isAuthenticated();
+  bool onNet = onAuthorizedNetwork();
+  bool canEdit = signedIn && onNet;
+  String authNote;
+  if (!signedIn) authNote = "Read-only. <a href='/login'>Sign in</a>.";
+  else if (!onNet) {
+    if (WiFi.status() != WL_CONNECTED) authNote = "Signed in, but WiFi is offline.";
+    else authNote = "Signed in, but not on " + String(AUTHORIZED_SSID) + ".";
+  }
+  else authNote = "Signed in. <a href='/logout'>Sign out</a>.";
+  String wifiLine;
+  if (wifiConnected) wifiLine = "WiFi: " + WiFi.SSID() + " | IP: " + wifiIpStr;
+  else if (apMode) wifiLine = "AP: " + String(AP_SSID) + " | IP: " + wifiIpStr;
+  else wifiLine = "WiFi: disconnected";
+
   String page;
   page += F("<!doctype html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>");
   page += F("<style>body{font-family:'Segoe UI',sans-serif;background:#0e1117;color:#e6e9f0;display:flex;justify-content:center;align-items:flex-start;min-height:100vh;padding:16px;} .card{background:#171b23;border-radius:18px;box-shadow:0 12px 30px rgba(0,0,0,0.45);width:460px;padding:20px;} h1{font-size:1.2rem;margin:0 0 8px;} .row{display:flex;align-items:center;justify-content:space-between;margin:6px 0;} .badge{padding:6px 10px;border-radius:12px;font-size:0.9rem;background:#232a36;} .big-temp{font-size:3.2rem;font-weight:700;text-align:center;margin:6px 0;} .mini{font-size:0.9rem;color:#a9b3c6;text-align:center;} .controls{display:flex;justify-content:space-around;margin:12px 0;} button.adj{width:68px;height:68px;border-radius:50%;border:none;font-size:2rem;color:#fefefe;background:#2f74ff;box-shadow:0 8px 18px rgba(47,116,255,0.35);cursor:pointer;} button.adj.minus{background:#334155;} .pill{background:#232a36;border-radius:14px;padding:10px;display:flex;align-items:center;justify-content:space-between;margin:8px 0;} .pill label{margin:0;font-size:0.95rem;} .pill .val{font-size:1.1rem;font-weight:600;} .hiddenField{display:none;} .footer{margin-top:14px;font-size:0.85rem;color:#8a93a8;text-align:center;} a{color:#8fb3ff;} .mode-buttons{display:flex;gap:8px;margin:8px 0;} .mode-buttons button{flex:1;padding:12px;border:none;border-radius:10px;font-size:1rem;font-weight:600;color:#fefefe;cursor:pointer;background:#232a36;} .mode-buttons button.active{background:#2f74ff;} .led{display:inline-block;width:10px;height:10px;border-radius:50%;margin-left:6px;background:#444;} .led.on{background:#30d158;} .nav{display:flex;gap:10px;margin:8px 0 12px;} .nav a{background:#232a36;color:#e6e9f0;text-decoration:none;padding:8px 12px;border-radius:10px;box-shadow:0 6px 12px rgba(0,0,0,0.25);} .nav a.active{background:#2f74ff;} .hide{display:none;} </style>");
@@ -421,12 +716,15 @@ void handleThermostat() {
   page += String(setpointF, 1);
   page += F(", diffVal=");
   page += String(diffF, 1);
-  page += F(", fanVal=0; let fanHold=null, fanHoldTimeout=null; function updateInputs(){document.getElementById('setVal').textContent=setVal.toFixed(1);document.getElementById('diffVal').textContent=diffVal.toFixed(1);document.getElementById('fanVal').textContent=fanVal.toFixed(0);document.getElementById('setpointInput').value=setVal.toFixed(1);document.getElementById('diffInput').value=diffVal.toFixed(1);document.getElementById('fanInput').value=fanVal.toFixed(0);} function adjust(type,delta,min,max){if(type==='set'){setVal=Math.min(Math.max(setVal+delta,min),max);}else if(type==='diff'){diffVal=Math.min(Math.max(diffVal+delta,min),max);}else if(type==='fan'){fanVal=Math.min(Math.max(fanVal+delta,min),max);}updateInputs();} function startFanHold(delta){stopFanHold();fanHoldTimeout=setTimeout(()=>{fanHold=setInterval(()=>adjust('fan',delta,0,60),500);},1000);} function stopFanHold(){clearTimeout(fanHoldTimeout);fanHoldTimeout=null;clearInterval(fanHold);fanHold=null;} function quickMode(m){document.getElementsByName('mode')[0].value=m; if(m==='fan'){let v=prompt('Fan minutes (0-60)','5'); if(v===null)return; fanVal=Math.min(Math.max(parseInt(v)||0,0),60); updateInputs();} document.forms[0].submit();} async function refresh(){try{const r=await fetch('/status');if(!r.ok)return;const d=await r.json();['mode','temp','hum','feel','heat','cool','fan'].forEach(id=>{const el=document.getElementById(id);if(el)el.textContent=d[id];}); document.getElementById('modeBadge').textContent=d.mode; document.getElementById('mode').textContent=d.mode; const led=document.getElementById('led'); const active = (d.heat==='ON'||d.cool==='ON'||d.fan==='ON'); if(led){led.className = 'led' + (active ? ' on' : '');} const fanRow=document.getElementById('fanRow'); const fanPill=document.getElementById('fanPill'); if(fanRow)fanRow.style.display = d.mode==='fan' ? 'block' : 'none'; if(fanPill)fanPill.style.display = d.mode==='fan' ? 'flex' : 'none'; }catch(e){}} async function sendTz(){try{const offsetSec = -new Date().getTimezoneOffset()*60; await fetch('/tz?offset=' + offsetSec);}catch(e){}} setInterval(refresh,1000);window.onload=function(){updateInputs();refresh();sendTz();};</script>");
+  page += F(", fanVal=0; const canControl=");
+  page += String(canEdit ? "true" : "false");
+  page += F("; let warned=false; let fanHold=null, fanHoldTimeout=null; function guard(){if(canControl)return true; if(!warned){alert('Sign in to change settings.'); warned=true;} return false;} function updateInputs(){document.getElementById('setVal').textContent=setVal.toFixed(1);document.getElementById('diffVal').textContent=diffVal.toFixed(1);document.getElementById('fanVal').textContent=fanVal.toFixed(0);document.getElementById('setpointInput').value=setVal.toFixed(1);document.getElementById('diffInput').value=diffVal.toFixed(1);document.getElementById('fanInput').value=fanVal.toFixed(0);} function adjust(type,delta,min,max){if(!guard())return; if(type==='set'){setVal=Math.min(Math.max(setVal+delta,min),max);}else if(type==='diff'){diffVal=Math.min(Math.max(diffVal+delta,min),max);}else if(type==='fan'){fanVal=Math.min(Math.max(fanVal+delta,min),max);}updateInputs();} function startFanHold(delta){if(!guard())return; stopFanHold();fanHoldTimeout=setTimeout(()=>{fanHold=setInterval(()=>adjust('fan',delta,0,60),500);},1000);} function stopFanHold(){clearTimeout(fanHoldTimeout);fanHoldTimeout=null;clearInterval(fanHold);fanHold=null;} function quickMode(m){if(!guard())return; document.getElementsByName('mode')[0].value=m; if(m==='fan'){let v=prompt('Fan minutes (0-60)','5'); if(v===null)return; fanVal=Math.min(Math.max(parseInt(v)||0,0),60); updateInputs();} document.forms[0].submit();} async function refresh(){try{const r=await fetch('/status');if(!r.ok)return;const d=await r.json();['mode','temp','hum','feel','heat','cool','fan'].forEach(id=>{const el=document.getElementById(id);if(el)el.textContent=d[id];}); document.getElementById('modeBadge').textContent=d.mode; document.getElementById('mode').textContent=d.mode; const led=document.getElementById('led'); const active = (d.heat==='ON'||d.cool==='ON'||d.fan==='ON'); if(led){led.className = 'led' + (active ? ' on' : '');} const fanRow=document.getElementById('fanRow'); const fanPill=document.getElementById('fanPill'); if(fanRow)fanRow.style.display = d.mode==='fan' ? 'block' : 'none'; if(fanPill)fanPill.style.display = d.mode==='fan' ? 'flex' : 'none'; }catch(e){}} async function sendTz(){if(!canControl)return; try{const offsetSec = -new Date().getTimezoneOffset()*60; await fetch('/tz?offset=' + offsetSec);}catch(e){}} setInterval(refresh,1000);window.onload=function(){updateInputs();refresh();sendTz(); if(!canControl){document.querySelectorAll('button.adj, .mode-buttons button, form button[type=submit]').forEach(b=>b.disabled=true);} };</script>");
   page += F("</head><body><div class='card'>");
   page += F("<div class='row'><h1>Thermostat</h1><div class='badge' id='modeBadge'>");
   page += mode + "</div></div>";
-  page += "<div class='nav'><a class='active' href='/thermostat'>Thermostat</a><a href='/schedule'>Schedule</a><a href='/history'>History</a><a href='/system_status'>System</a></div>";
-  page += "<div class='mini'>WiFi IP: " + WiFi.localIP().toString() + "</div>";
+  page += "<div class='nav'><a class='active' href='/thermostat'>Thermostat</a><a href='/schedule'>Schedule</a><a href='/history'>History</a><a href='/system_status'>System</a><a href='/wifi'>WiFi</a></div>";
+  page += "<div class='mini'>" + wifiLine + "</div>";
+  page += "<div class='mini'>" + authNote + "</div>";
   page += "<div class='mini'>Temp: <span id='temp'>--</span></div>";
   page += "<div class='big-temp'><span id='feel'>--</span></div>";
   page += "<div class='mini'>Humidity: <span id='hum'>--</span> | Mode: <span id='mode'>" + mode + "</span> <span id='led' class='led" + String((heatOn||coolOn||fanOn) ? " on" : "") + "'></span></div>";
@@ -457,7 +755,7 @@ void handleThermostat() {
   page += "<input type='hidden' class='hiddenField' id='fanInput' name='fan' value='0'>";
   page += "<div class='pill'><label>Control source</label><div class='val'>" + schedLabel + " &ndash; " + schedVal + "</div></div>";
 
-  page += "<button type='submit' style='width:100%;padding:12px;font-size:1.1rem;margin-top:8px;'>Update</button>";
+  page += "<button type='submit' style='width:100%;padding:12px;font-size:1.1rem;margin-top:8px;'" + String(canEdit ? "" : " disabled") + ">Update</button>";
   page += F("</form>");
   page += F("<div class='footer'>Controls stay put; live data refreshes every second. For data logging/remote access, see notes in code.</div>");
   page += F("</div></body></html>");
@@ -466,27 +764,32 @@ void handleThermostat() {
 
 void handleSchedule() {
   static const char* dayNames[7] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+  bool canEdit = canControl();
+  String authNote = canEdit ? "" : "Read-only. <a href='/login'>Sign in</a> to edit schedule.";
   String page;
   page += F("<!doctype html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>");
   page += F("<style>body{font-family:'Segoe UI',sans-serif;background:#0e1117;color:#e6e9f0;display:flex;justify-content:center;align-items:flex-start;min-height:100vh;padding:16px;} .card{background:#171b23;border-radius:18px;box-shadow:0 12px 30px rgba(0,0,0,0.45);width:100%;max-width:960px;padding:20px;} h1{font-size:1.2rem;margin:0 0 8px;} .nav{display:flex;gap:10px;margin:8px 0 12px;} .nav a{background:#232a36;color:#e6e9f0;text-decoration:none;padding:8px 12px;border-radius:10px;box-shadow:0 6px 12px rgba(0,0,0,0.25);} .nav a.active{background:#2f74ff;} .legend{font-size:0.9rem;color:#a9b3c6;margin:6px 0;} .dayrow{display:flex;align-items:center;gap:10px;margin:8px 0;} .dayname{width:60px;font-weight:700;text-align:right;color:#e6e9f0;} .bar{flex:1;position:relative;height:26px;background:#11161f;border-radius:12px;overflow:hidden;box-shadow:inset 0 0 0 1px #222a35;} .seg{position:absolute;top:0;bottom:0;border-radius:10px;opacity:0.9;} .seg span{position:absolute;left:6px;top:4px;font-size:0.8rem;color:#fff;} .controls{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;} button{border:none;border-radius:10px;background:#2f74ff;color:#fff;padding:10px 14px;font-size:1rem;cursor:pointer;box-shadow:0 6px 12px rgba(0,0,0,0.25);} button.secondary{background:#334155;} .hint{color:#8a93a8;font-size:0.85rem;margin-top:6px;} </style>");
   page += F("</head><body><div class='card'>");
   page += F("<div class='row'><h1>Schedule</h1><div></div></div>");
-  page += "<div class='nav'><a href='/thermostat'>Thermostat</a><a class='active' href='/schedule'>Schedule</a><a href='/history'>History</a><a href='/system_status'>System</a></div>";
+  page += "<div class='nav'><a href='/thermostat'>Thermostat</a><a class='active' href='/schedule'>Schedule</a><a href='/history'>History</a><a href='/system_status'>System</a><a href='/wifi'>WiFi</a></div>";
+  if (authNote.length() > 0) page += "<div class='legend'>" + authNote + "</div>";
   page += "<div class='legend'>Long-press a day's bar to add a setpoint block. Manual changes hold until the next scheduled block; when a day has no blocks it follows the manual setpoint.</div>";
   page += "<div id='schedule'></div>";
-  page += "<div class='controls'><button onclick='reloadSchedule()'>Refresh</button><button class='secondary' onclick='clearAll()'>Clear all days</button></div>";
+  page += "<div class='controls'><button onclick='reloadSchedule()'>Refresh</button><button class='secondary' onclick='clearAll()'" + String(canEdit ? "" : " disabled") + ">Clear all days</button></div>";
   page += "<div class='hint'>Blocks are inclusive of the end hour. Example: start 8, end 10 covers 8,9,10. Clear all if you want to stay manual-only.</div>";
   page += "<script>";
-  page += "const dayNames=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];const dayOrder=[1,2,3,4,5,6,0];let schedule=[];let pressTimer=null;";
+  page += "const dayNames=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];const dayOrder=[1,2,3,4,5,6,0];const canControl=";
+  page += String(canEdit ? "true" : "false");
+  page += ";let warned=false;function guard(){if(canControl)return true; if(!warned){alert('Sign in to edit schedule.'); warned=true;} return false;} let schedule=[];let pressTimer=null;";
   page += "function colorForSet(sp){const base=170-Math.min(Math.max((sp-60)*3,0),120);return `rgb(47,116,255,0.85)`;}";
   page += "function ensureSchedule(){if(!Array.isArray(schedule)||schedule.length<7){const filled=[];for(let i=0;i<7;i++){const hrs=new Array(24).fill(NaN);filled.push(hrs);}schedule=filled;}}";
   page += "function render(){ensureSchedule();const wrap=document.getElementById('schedule');wrap.innerHTML='';dayOrder.forEach((dayIdx,displayIdx)=>{const hours=schedule[dayIdx];const row=document.createElement('div');row.className='dayrow';row.innerHTML=`<div class='dayname'>${dayNames[displayIdx]}</div><div class='bar' data-day='${dayIdx}'></div>`;const bar=row.querySelector('.bar');bar.addEventListener('pointerdown',e=>startPress(e,dayIdx,bar));bar.addEventListener('pointerup',cancelPress);bar.addEventListener('pointerleave',cancelPress);let start=-1,lastSp=NAN;for(let h=0;h<25;h++){const sp=h<24?hours[h]:NAN;if(!isnan(sp)&&isnan(lastSp)){start=h;lastSp=sp;}else if((isnan(sp)&&!isnan(lastSp))||(!isnan(sp)&&!isnan(lastSp)&&fabs(sp-lastSp)>0.01)){addSeg(bar,start,h-1,lastSp);start=isnan(sp)?-1:h;lastSp=sp;}else if(h==24&&!isnan(lastSp)){addSeg(bar,start,23,lastSp);} }wrap.appendChild(row);});}";
   page += "function addSeg(bar,start,end,sp){if(start<0||end<start)return;const seg=document.createElement('div');const left=(start/24)*100;const width=((end-start+1)/24)*100;seg.className='seg';seg.style.left=left+'%';seg.style.width=width+'%';seg.style.background=colorForSet(sp);seg.innerHTML=`<span>${sp.toFixed(0)}°</span>`;bar.appendChild(seg);}";
-  page += "function startPress(ev,day,bar){cancelPress();pressTimer=setTimeout(()=>{pressTimer=null;createBlock(ev,day,bar);},500);}function cancelPress(){if(pressTimer){clearTimeout(pressTimer);pressTimer=null;}}";
+  page += "function startPress(ev,day,bar){if(!guard())return; cancelPress();pressTimer=setTimeout(()=>{pressTimer=null;createBlock(ev,day,bar);},500);}function cancelPress(){if(pressTimer){clearTimeout(pressTimer);pressTimer=null;}}";
   page += "function createBlock(ev,day,bar){const rect=bar.getBoundingClientRect();const pct=Math.max(0,Math.min(1,(ev.clientX-rect.left)/rect.width));const start=Math.floor(pct*24);const duration=parseInt(prompt(`Duration hours (1-24) starting at ${start}:00`,`2`)||'0');if(!duration||duration<1||duration>24)return;const end=(start+duration-1)%24;const sp=parseFloat(prompt('Setpoint °F','70'))||70;applyBlock(day,start,end,sp);} ";
   page += "async function applyBlock(day,start,end,sp){const qs=new URLSearchParams({sch_apply:'1',sch_day:day,sch_start:start,sch_end:end,sch_setpoint:sp.toFixed(1)});await fetch('/set?'+qs.toString());reloadSchedule();}";
-  page += "async function clearDay(day){await fetch('/set?'+new URLSearchParams({sch_clear:'1',sch_day:day}).toString());reloadSchedule();}";
-  page += "async function clearAll(){for(let d=0;d<7;d++){await clearDay(d);} }";
+  page += "async function clearDay(day){if(!guard())return; await fetch('/set?'+new URLSearchParams({sch_clear:'1',sch_day:day}).toString());reloadSchedule();}";
+  page += "async function clearAll(){if(!guard())return; for(let d=0;d<7;d++){await clearDay(d);} }";
   page += "async function reloadSchedule(){const r=await fetch('/schedule_data');if(!r.ok)return;const data=await r.json();schedule=data.schedule||[];ensureSchedule();render();}";
   page += "function fabs(x){return x<0?-x:x;} function isnan(x){return x!==x;}";
   page += "reloadSchedule();";
@@ -578,16 +881,20 @@ void handleSystemStatusData() {
 }
 
 void handleSet() {
+  if (!requireControlAuth()) return;
   bool updated = false;
   bool manualChange = false;
   if (server.hasArg("setpoint")) {
     setpointF = server.arg("setpoint").toFloat();
+    if (setpointF < 40.0f) setpointF = 40.0f;
+    if (setpointF > 90.0f) setpointF = 90.0f;
     updated = true;
     manualChange = true;
   }
   if (server.hasArg("diff")) {
     diffF = server.arg("diff").toFloat();
     if (diffF < 0.1f) diffF = 0.1f;
+    if (diffF > 10.0f) diffF = 10.0f;
     updated = true;
     manualChange = true;
   }
@@ -652,7 +959,7 @@ void handleSystemStatus() {
   page += F("<style>body{font-family:'Segoe UI',sans-serif;background:#0e1117;color:#e6e9f0;display:flex;justify-content:center;align-items:flex-start;min-height:100vh;padding:16px;} .card{background:#171b23;border-radius:18px;box-shadow:0 12px 30px rgba(0,0,0,0.45);width:100%;max-width:960px;padding:20px;} h1{font-size:1.2rem;margin:0 0 8px;} .nav{display:flex;gap:10px;margin:8px 0 12px;} .nav a{background:#232a36;color:#e6e9f0;text-decoration:none;padding:8px 12px;border-radius:10px;box-shadow:0 6px 12px rgba(0,0,0,0.25);} .nav a.active{background:#2f74ff;} .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-top:10px;} .tile{background:#11161f;border-radius:12px;padding:12px;box-shadow:inset 0 0 0 1px #222a35;} .label{font-size:0.9rem;color:#8a93a8;margin-bottom:4px;} .value{font-size:1rem;font-weight:700;} .pill{display:inline-block;padding:4px 10px;border-radius:999px;font-size:0.9rem;font-weight:700;} .go{background:#123821;color:#30d158;} .nogo{background:#3d1b1b;color:#ff6b6b;} .detail{font-size:0.9rem;color:#a9b3c6;margin-top:4px;} </style>");
   page += F("</head><body><div class='card'>");
   page += F("<div class='row'><h1>System Status</h1><div></div></div>");
-  page += "<div class='nav'><a href='/thermostat'>Thermostat</a><a href='/schedule'>Schedule</a><a href='/history'>History</a><a class='active' href='/system_status'>System</a></div>";
+  page += "<div class='nav'><a href='/thermostat'>Thermostat</a><a href='/schedule'>Schedule</a><a href='/history'>History</a><a class='active' href='/system_status'>System</a><a href='/wifi'>WiFi</a></div>";
   page += "<div id='grid' class='grid'></div>";
   page += "<div class='detail'>Shows live health for sensors, relays, WiFi, SD, and schedule/manual state.</div>";
   page += "<script>";
@@ -670,7 +977,7 @@ void handleHistory() {
   page += F("<style>body{font-family:'Segoe UI',sans-serif;background:#0e1117;color:#e6e9f0;display:flex;justify-content:center;align-items:flex-start;min-height:100vh;padding:16px;} .card{background:#171b23;border-radius:18px;box-shadow:0 12px 30px rgba(0,0,0,0.45);width:100%;max-width:960px;padding:20px;} h1{font-size:1.2rem;margin:0 0 8px;} .nav{display:flex;gap:10px;margin:8px 0 12px;} .nav a{background:#232a36;color:#e6e9f0;text-decoration:none;padding:8px 12px;border-radius:10px;box-shadow:0 6px 12px rgba(0,0,0,0.25);} .nav a.active{background:#2f74ff;} .controls{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0;} button{border:none;border-radius:10px;background:#2f74ff;color:#fff;padding:10px 14px;font-size:1rem;cursor:pointer;box-shadow:0 6px 12px rgba(0,0,0,0.25);} button.secondary{background:#334155;} .hint{color:#8a93a8;font-size:0.85rem;} canvas{background:#0b0f16;border-radius:12px;width:100%;height:360px;box-shadow:inset 0 0 0 1px #222a35;} .legend{display:flex;gap:10px;font-size:0.9rem;margin-top:6px;} .swatch{width:14px;height:14px;border-radius:4px;display:inline-block;margin-right:4px;} </style>");
   page += F("</head><body><div class='card'>");
   page += F("<div class='row'><h1>History</h1><div></div></div>");
-  page += "<div class='nav'><a href='/thermostat'>Thermostat</a><a href='/schedule'>Schedule</a><a class='active' href='/history'>History</a><a href='/system_status'>System</a></div>";
+  page += "<div class='nav'><a href='/thermostat'>Thermostat</a><a href='/schedule'>Schedule</a><a class='active' href='/history'>History</a><a href='/system_status'>System</a><a href='/wifi'>WiFi</a></div>";
   page += "<div class='controls'><button onclick=\"setRange('day')\">Day</button><button onclick=\"setRange('week')\">Week</button><button onclick=\"setRange('month')\">Month</button><button class='secondary' onclick='loadHistory()'>Refresh</button></div>";
   page += "<canvas id='chart' width='900' height='360'></canvas>";
   page += "<div class='legend'><span><span class='swatch' style='background:#2f74ff'></span>Setpoint</span><span><span class='swatch' style='background:#30d158'></span>Temperature</span></div>";
@@ -705,6 +1012,7 @@ void handleStatus() {
 
 // Set timezone offset (seconds) from client
 void handleTz() {
+  if (!requireControlAuth()) return;
   if (server.hasArg("offset")) {
     tzOffsetSec = server.arg("offset").toInt();
     configTime(tzOffsetSec, dstOffsetSec, "pool.ntp.org", "time.nist.gov", "time.google.com");
@@ -815,6 +1123,23 @@ void updateDisplay() {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
+  if (!wifiConnected) {
+    display.setCursor(0, 0);
+    display.println("WiFi disconnected");
+    display.setCursor(0, 16);
+    if (apMode) {
+      display.print("AP: ");
+      display.println(AP_SSID);
+      display.print("Go to http://");
+      display.println(wifiIpStr);
+    } else {
+      display.println("AP starting...");
+      display.print("IP: ");
+      display.println(wifiIpStr);
+    }
+    display.display();
+    return;
+  }
   if (menuState == VIEW) {
     display.setCursor(0, 0);
     display.print("Mode ");
