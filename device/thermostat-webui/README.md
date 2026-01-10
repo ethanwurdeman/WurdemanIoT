@@ -11,9 +11,9 @@ Arduino sketch for an ESP32 thermostat with DHT22, OLED, relay control, scheduli
 - SD (SPI): CS D8, SCK D13, MOSI D11, MISO D9
 
 ## Build / Upload
-1) Open `thermostat_webui.ino` in the Arduino IDE.
-2) Update WiFi credentials and pins if needed.
-3) Select your ESP32 board and flash.
+1) Open this folder in PlatformIO.
+2) Check `platformio.ini` for the correct board and serial port.
+3) Build and upload.
 
 ## Notes
 - Web UI endpoints: `/thermostat`, `/status`, `/set`, `/schedule`, `/history`, `/system_status`.
