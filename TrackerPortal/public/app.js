@@ -37,6 +37,7 @@ const DEFAULT_CONFIG = {
 const HISTORY_LIMIT = 2000;
 const HISTORY_RENDER_LIMIT = 200;
 const DEFAULT_WINDOW_MINUTES = 60;
+const THERMOSTAT_STORAGE_KEY = "thermostat.baseUrl";
 
 const state = {
   user: null,
@@ -53,6 +54,7 @@ const state = {
   historyPoints: [],
   currentConfig: null,
   lastSnapshot: null,
+  thermostatLoadTimeout: null,
   debug: {
     deviceError: null,
     devicesError: null,
@@ -65,7 +67,7 @@ const routes = [
   { pattern: /^\/home$/, handler: renderHome },
   { pattern: /^\/dog\/([^/]+)$/, handler: (_path, id) => renderDog(id) },
   { pattern: /^\/pet\/([^/]+)$/, handler: (_path, id) => renderDog(id, "Pet") },
-  { pattern: /^\/thermostat$/, handler: () => renderComingSoon("Thermostat") }
+  { pattern: /^\/thermostat$/, handler: renderThermostat }
 ];
 
 const view = document.getElementById("view");
@@ -181,6 +183,132 @@ function renderComingSoon(label) {
       <p class="muted">Coming soon.</p>
     </section>
   `;
+}
+
+function renderThermostat() {
+  cleanupListeners();
+  view.innerHTML = `
+    <div class="section-header">
+      <div>
+        <h2>Thermostat</h2>
+        <p class="muted">Load the device web UI from your local network.</p>
+      </div>
+      <span class="pill offline" id="thermo-conn-pill"><span class="dot"></span>Device: -</span>
+    </div>
+
+    <div class="card thermo-card">
+      <div class="thermo-config">
+        <label>
+          Thermostat URL
+          <input type="text" id="thermo-url" placeholder="http://192.168.1.50">
+        </label>
+        <div class="thermo-actions">
+          <button class="btn" type="button" id="thermo-load-btn">Load UI</button>
+          <button class="btn ghost" type="button" id="thermo-open-btn">Open in new tab</button>
+        </div>
+        <div class="muted" id="thermo-hint">Tip: use the device IP or hostname (example: http://192.168.1.50).</div>
+      </div>
+    </div>
+
+    <div class="card thermo-frame-card">
+      <div class="section-header">
+        <h3>Thermostat UI</h3>
+        <span class="muted" id="thermo-status">Waiting for device URL.</span>
+      </div>
+      <div class="thermo-frame-wrap">
+        <iframe id="thermo-frame" title="Thermostat UI" src="about:blank" loading="lazy"></iframe>
+      </div>
+    </div>
+  `;
+
+  const urlInput = document.getElementById("thermo-url");
+  const loadBtn = document.getElementById("thermo-load-btn");
+  const openBtn = document.getElementById("thermo-open-btn");
+  const frame = document.getElementById("thermo-frame");
+  const statusEl = document.getElementById("thermo-status");
+  const pill = document.getElementById("thermo-conn-pill");
+
+  const savedUrl = getThermostatUrl();
+  if (urlInput && savedUrl) {
+    urlInput.value = savedUrl;
+  }
+
+  function setPill(state, label) {
+    if (!pill) return;
+    pill.className = `pill ${state}`;
+    pill.innerHTML = `<span class="dot"></span>${label}`;
+  }
+
+  function loadThermostatUi() {
+    if (!urlInput || !frame || !statusEl) return;
+    const normalized = normalizeThermostatUrl(urlInput.value);
+    if (!normalized) {
+      statusEl.textContent = "Enter a device URL to load the UI.";
+      setPill("offline", "Device: not set");
+      frame.src = "about:blank";
+      return;
+    }
+    setThermostatUrl(normalized);
+    const target = `${normalized}/thermostat`;
+    statusEl.textContent = `Loading ${target} ...`;
+    setPill("stale", `Device: ${normalized}`);
+    frame.src = target;
+    if (state.thermostatLoadTimeout) {
+      clearTimeout(state.thermostatLoadTimeout);
+    }
+    state.thermostatLoadTimeout = setTimeout(() => {
+      if (statusEl.textContent.startsWith("Loading")) {
+        statusEl.textContent = "Still loading... check network or device URL.";
+        setPill("stale", `Device: ${normalized}`);
+      }
+    }, 8000);
+  }
+
+  if (loadBtn) {
+    loadBtn.addEventListener("click", loadThermostatUi);
+  }
+  if (openBtn) {
+    openBtn.addEventListener("click", () => {
+      if (!urlInput) return;
+      const normalized = normalizeThermostatUrl(urlInput.value);
+      if (!normalized) return;
+      window.open(`${normalized}/thermostat`, "_blank", "noopener");
+    });
+  }
+  if (urlInput) {
+    urlInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        loadThermostatUi();
+      }
+    });
+  }
+  if (frame) {
+    frame.addEventListener("load", () => {
+      if (!statusEl || !urlInput) return;
+      if (frame.src === "about:blank") return;
+      if (state.thermostatLoadTimeout) {
+        clearTimeout(state.thermostatLoadTimeout);
+        state.thermostatLoadTimeout = null;
+      }
+      const normalized = normalizeThermostatUrl(urlInput.value);
+      statusEl.textContent = normalized
+        ? `Loaded ${normalized}/thermostat`
+        : "Loaded device UI.";
+      setPill("online", `Device: ${normalized || "unknown"}`);
+    });
+    frame.addEventListener("error", () => {
+      if (!statusEl) return;
+      statusEl.textContent = "Failed to load device UI.";
+      setPill("offline", "Device: unreachable");
+    });
+  }
+
+  if (savedUrl) {
+    loadThermostatUi();
+  } else {
+    setPill("offline", "Device: not set");
+  }
 }
 
 function renderHome() {
@@ -1002,6 +1130,28 @@ function formatDayLabel(date) {
   return new Intl.DateTimeFormat("en", { month: "short", day: "numeric" }).format(target);
 }
 
+function normalizeThermostatUrl(raw) {
+  if (!raw) return "";
+  let url = String(raw).trim();
+  if (!url) return "";
+  if (!/^https?:\/\//i.test(url)) {
+    url = `http://${url}`;
+  }
+  return url.replace(/\/+$/, "");
+}
+
+function getThermostatUrl() {
+  return localStorage.getItem(THERMOSTAT_STORAGE_KEY) || "";
+}
+
+function setThermostatUrl(url) {
+  if (!url) {
+    localStorage.removeItem(THERMOSTAT_STORAGE_KEY);
+    return;
+  }
+  localStorage.setItem(THERMOSTAT_STORAGE_KEY, url);
+}
+
 function toggleAuthButtons(disabled) {
   signInBtn.disabled = disabled || !!state.user;
   signOutBtn.disabled = disabled || !state.user;
@@ -1019,6 +1169,10 @@ function cleanupListeners() {
   if (state.historyTimer) {
     clearInterval(state.historyTimer);
     state.historyTimer = null;
+  }
+  if (state.thermostatLoadTimeout) {
+    clearTimeout(state.thermostatLoadTimeout);
+    state.thermostatLoadTimeout = null;
   }
   if (state.map) {
     state.map.remove();

@@ -11,7 +11,7 @@ Single-page Firebase Hosting app for the WurdemanIoT control center plus Cloud F
 ## Routes
 - `#/home`: device grid with online/stale indicators and deep links.
 - `#/dog/{deviceId}`: live last-location listener, config controls (geofence, ping cadence, force roam), day selector + scrubber, and history polyline.
-- `#/thermostat`: placeholder.
+- `#/thermostat`: embedded device UI (enter the thermostat URL).
 
 ## Firestore data model
 - `devices/{deviceId}`:
