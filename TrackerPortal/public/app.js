@@ -74,6 +74,7 @@ const routes = [
   { pattern: /^\/home$/, handler: renderHome },
   { pattern: /^\/dog\/([^/]+)$/, handler: (_path, id) => renderDog(id) },
   { pattern: /^\/pet\/([^/]+)$/, handler: (_path, id) => renderDog(id, "Pet") },
+  { pattern: /^\/$/, handler: renderLanding },
   { pattern: /^\/thermostat$/, handler: renderThermostat }
 ];
 
@@ -142,7 +143,19 @@ function updateAuthUI() {
 }
 
 function router() {
-  const path = (window.location.hash.replace(/^#/, "") || "/home").replace(/\/+$/, "") || "/home";
+  const raw = window.location.hash.replace(/^#/, "");
+  const path = (raw || "/").replace(/\/+$/, "") || "/";
+
+  if (!state.user && path !== "/") {
+    window.location.hash = "#/";
+    return;
+  }
+  if (state.user && (path === "/" || path === "")) {
+    window.location.hash = "#/home";
+    return;
+  }
+
+  setLandingMode(!state.user && path === "/");
 
   for (const r of routes) {
     const match = path.match(r.pattern);
@@ -188,6 +201,16 @@ function renderComingSoon(label) {
     <section class="placeholder">
       <h2>${label}</h2>
       <p class="muted">Coming soon.</p>
+    </section>
+  `;
+}
+
+function renderLanding() {
+  cleanupListeners();
+  view.innerHTML = `
+    <section class="placeholder">
+      <h2>Welcome to WurdemanIoT</h2>
+      <p class="muted">Sign in above to access devices.</p>
     </section>
   `;
 }
@@ -1599,6 +1622,12 @@ function formatDayLabel(date) {
   const yesterday = addDays(today, -1);
   if (target.getTime() === yesterday.getTime()) return "Yesterday";
   return new Intl.DateTimeFormat("en", { month: "short", day: "numeric" }).format(target);
+}
+
+function setLandingMode(on) {
+  const nav = document.querySelector(".nav-links");
+  if (nav) nav.style.display = on ? "none" : "";
+  document.body.classList.toggle("landing", !!on);
 }
 
 function toggleAuthButtons(disabled) {

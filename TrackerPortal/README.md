@@ -9,6 +9,7 @@ Single-page Firebase Hosting app for the WurdemanIoT control center plus Cloud F
 - Cloud Functions (TypeScript, Node 20, firebase-functions v2 onRequest)
 
 ## Routes
+- `/` (no hash): landing sign-in prompt only; redirects to `#/home` after auth.
 - `#/home`: device grid with online/stale indicators and deep links.
 - `#/dog/{deviceId}`: live last-location listener, config controls (geofence, ping cadence, force roam), day selector + scrubber, and history polyline.
 - `#/thermostat`: Firebase-backed thermostat status, controls, schedule, and history.

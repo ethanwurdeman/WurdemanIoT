@@ -1,6 +1,6 @@
-# T-SIM7080G-S3 Firmware
+# Tyee Tracker Firmware
 
-PlatformIO Arduino sketch for LilyGo T-SIM7080G-S3 (ESP32-S3 + SIM7080G + GNSS + SD).
+PlatformIO Arduino sketch for LilyGo T-SIM7080G-S3 (ESP32-S3 + SIM7080G + GNSS + SD). Device name: Tyee.
 
 ## Setup
 1) Install PlatformIO Core or VS Code + PlatformIO extension.
@@ -13,7 +13,7 @@ PlatformIO Arduino sketch for LilyGo T-SIM7080G-S3 (ESP32-S3 + SIM7080G + GNSS +
 
 ## Build / Upload
 ```
-cd device/tsim7080g-s3
+cd device/tyee
 pio run          # build
 pio run -t upload  # flash
 pio device monitor -b 115200  # serial logs
