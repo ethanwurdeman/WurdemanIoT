@@ -1,18 +1,49 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 #include <WebServer.h>
 #include <Preferences.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <time.h>
+#include <math.h>
 #include "DHT.h"
+#include <ArduinoJson.h>
 #include <SPI.h>
 #include <SD.h>
 
+#if __has_include("secrets.h")
+#include "secrets.h"
+#endif
+
 // === User config ===
-const char *WIFI_SSID     = "Wurdeman Starlink 2.4";
-const char *WIFI_PASSWORD = "Koda2020";
+#ifndef WIFI_SSID
+#define WIFI_SSID "Wurdeman Starlink 2.4"
+#endif
+#ifndef WIFI_PASSWORD
+#define WIFI_PASSWORD "Koda2020"
+#endif
+#ifndef THERMOSTAT_DEVICE_ID
+#define THERMOSTAT_DEVICE_ID "home"
+#endif
+#ifndef THERMOSTAT_DEVICE_TOKEN
+#define THERMOSTAT_DEVICE_TOKEN "REPLACE_ME"
+#endif
+#ifndef THERMOSTAT_INGEST_URL
+#define THERMOSTAT_INGEST_URL "https://us-central1-wurdemaniot.cloudfunctions.net/thermostatIngest"
+#endif
+#ifndef THERMOSTAT_CONFIG_URL
+#define THERMOSTAT_CONFIG_URL "https://us-central1-wurdemaniot.cloudfunctions.net/thermostatConfig"
+#endif
+
+const char *DEFAULT_WIFI_SSID = WIFI_SSID;
+const char *DEFAULT_WIFI_PASSWORD = WIFI_PASSWORD;
+const char *THERMOSTAT_DEVICE_ID_STR = THERMOSTAT_DEVICE_ID;
+const char *THERMOSTAT_DEVICE_TOKEN_STR = THERMOSTAT_DEVICE_TOKEN;
+const char *THERMOSTAT_INGEST_ENDPOINT = THERMOSTAT_INGEST_URL;
+const char *THERMOSTAT_CONFIG_ENDPOINT = THERMOSTAT_CONFIG_URL;
 const char *AUTHORIZED_SSID = "WurdemanIoT"; // network required for control changes
 const char *ADMIN_USER = "admin";
 const char *ADMIN_PASSWORD = "change-me";
@@ -21,19 +52,13 @@ const char *AP_PASSWORD = "";
 const char *HEADER_KEYS[] = {"Cookie"};
 const size_t HEADER_KEYS_COUNT = 1;
 
-// Pins (board labels)
-const int HEAT_PIN = D12; // heat relay output (moved from D5)
+// Pins (Arduino Nano ESP32 board labels)
+const int HEAT_PIN = D12; // heat relay output
 const int COOL_PIN = D6;  // cool relay output
 const int FAN_PIN  = D7;  // fan relay output
-const int DHT_PIN  = D10; // DHT22 data
-const int I2C_SDA  = A4;  // OLED SDA
-const int I2C_SCL  = A5;  // OLED SCL
-
-// Buttons (active LOW, INPUT_PULLUP)
-const int BTN_OK   = D2;
-const int BTN_BACK = D3;
-const int BTN_UP   = D4;
-const int BTN_DOWN = D5;
+const int DHT_PIN  = D2;  // DHT22 data
+const int I2C_SDA  = A5;  // OLED SDA (per wiring)
+const int I2C_SCL  = A4;  // OLED SCL (per wiring)
 
 // Relay polarity: set to true if HIGH turns the relay ON, false if LOW turns it ON
 const bool RELAY_ACTIVE_HIGH = true;
@@ -54,11 +79,11 @@ uint8_t fanRequestMinutes = 0; // pending fan timer request (minutes)
 // Anti-short-cycle timings (ms)
 const unsigned long MIN_ON_TIME_MS  = 600000;  // 10 minutes minimum ON
 const unsigned long MIN_OFF_TIME_MS = 1800000; // 30 minutes minimum OFF
-// SD card (SPI) wiring: CS=D8, SCK=D13, MOSI=D11, MISO=D9
-const int SD_CS   = 8;
-const int SD_SCK  = 13;
-const int SD_MOSI = 11;
-const int SD_MISO = 9;
+// SD card (SPI) wiring: CS=D10, SCK=D13, MOSI=D11, MISO=D12
+const int SD_CS   = SS;
+const int SD_SCK  = SCK;
+const int SD_MOSI = MOSI;
+const int SD_MISO = MISO;
 bool sdReady = false;
 const bool DEBUG_SERIAL = true;
 const unsigned long HEALTH_LOG_INTERVAL_MS = 30000;
@@ -69,6 +94,18 @@ unsigned long lastSdWriteMs = 0;
 bool lastSdWriteOk = true;
 const char* lastSdError = "none";
 unsigned long sdWriteFailures = 0;
+const unsigned long CLOUD_PUSH_INTERVAL_MS = 60000;
+const unsigned long CONFIG_FETCH_INTERVAL_MS = 120000;
+const unsigned long CONFIG_PUSH_INTERVAL_MS = 15000;
+unsigned long lastCloudPush = 0;
+unsigned long lastConfigFetch = 0;
+unsigned long lastConfigPush = 0;
+bool configDirty = false;
+bool historyDirty = false;
+uint32_t lastHistTs = 0;
+float lastHistCtl = NAN;
+float lastHistSetpoint = NAN;
+uint32_t fanUntilEpoch = 0;
 
 // OLED setup
 #define SCREEN_WIDTH 128
@@ -114,9 +151,11 @@ int overrideStartHour = -1;
 // History logging (setpoint vs control temperature, 1-min samples, up to 7 days)
 const unsigned long HISTORY_INTERVAL_MS = 60000;
 const int HIST_MAX = 10080; // 7 days at 1-minute resolution
-float histTemp[HIST_MAX];
-float histSet[HIST_MAX];
-uint32_t histTs[HIST_MAX];
+const int16_t HIST_NA = -32768;
+int16_t histTemp10[HIST_MAX];
+int16_t histSet10[HIST_MAX];
+uint16_t histMin[HIST_MAX];
+uint32_t histBaseEpoch = 0;
 int histCount = 0;
 int histIndex = 0;
 unsigned long lastHistLog = 0;
@@ -127,15 +166,6 @@ String fmtBytes(uint64_t b) {
   if (b >= (1ULL << 10)) return String((float)b / (1 << 10), 1) + " KB";
   return String((unsigned long)b) + " B";
 }
-
-// Menu / buttons
-enum MenuState { VIEW, MENU_MODE, MENU_SET, MENU_DIFF };
-MenuState menuState = VIEW;
-int modeIndex = 0; // 0 heat,1 cool,2 fan,3 off
-const char* modes[] = {"heat","cool","fan","off"};
-bool lastOk = HIGH, lastBack = HIGH, lastUp = HIGH, lastDown = HIGH;
-unsigned long lastBtnChange = 0;
-const unsigned long DEBOUNCE_MS = 50;
 
 void handleThermostat();
 void handleSchedule();
@@ -153,8 +183,6 @@ void handleLogin();
 void handleLogout();
 void setOutput(int pin, bool on);
 void updateDisplay();
-void handleButtons();
-void cycleMode(int dir);
 void logHealth();
 void logSdCardInfo(const char* context);
 void sdWriteTest();
@@ -169,33 +197,31 @@ bool onAuthorizedNetwork();
 bool canControl();
 bool requireControlAuth();
 String makeToken();
+void tickCloudSync();
+bool pushThermostatStatus(bool includeHistory);
+bool fetchThermostatConfig();
+bool pushThermostatConfig();
+void markConfigDirty();
+void applyRemoteConfig(JsonObject config);
 
 void setup() {
   Serial.begin(115200);
   pinMode(HEAT_PIN, OUTPUT);
   pinMode(COOL_PIN, OUTPUT);
   pinMode(FAN_PIN, OUTPUT);
-  pinMode(BTN_OK, INPUT_PULLUP);
-  pinMode(BTN_BACK, INPUT_PULLUP);
-  pinMode(BTN_UP, INPUT_PULLUP);
-  pinMode(BTN_DOWN, INPUT_PULLUP);
   setOutput(HEAT_PIN, false);
   setOutput(COOL_PIN, false);
   setOutput(FAN_PIN, false);
   lastHeatToggle = millis() - MIN_OFF_TIME_MS; // allow first cycle immediately
   lastCoolToggle = millis() - MIN_OFF_TIME_MS;
 
-  // Sync mode index
-  for (int i = 0; i < 4; i++) {
-    if (mode == modes[i]) { modeIndex = i; break; }
-  }
   for (int d = 0; d < 7; d++) {
     for (int h = 0; h < 24; h++) scheduleSP[d][h] = NAN;
   }
   for (int i = 0; i < HIST_MAX; i++) {
-    histTemp[i] = NAN;
-    histSet[i] = NAN;
-    histTs[i] = 0;
+    histTemp10[i] = HIST_NA;
+    histSet10[i] = HIST_NA;
+    histMin[i] = 0;
   }
 
   dht.begin();
@@ -346,10 +372,21 @@ void loop() {
     // Fan timer (manual fan mode)
     if (mode == "fan" && fanRequestMinutes > 0) {
       fanRunUntil = now + (unsigned long)fanRequestMinutes * 60000UL;
+      uint32_t nowEpoch = (uint32_t)time(nullptr);
+      if (nowEpoch > 0) {
+        fanUntilEpoch = nowEpoch + (uint32_t)fanRequestMinutes * 60UL;
+      } else {
+        fanUntilEpoch = 0;
+      }
       fanRequestMinutes = 0; // consume request
+      markConfigDirty();
     }
     if (fanRunUntil > 0 && now >= fanRunUntil) {
       fanRunUntil = 0;
+      if (fanUntilEpoch != 0) {
+        fanUntilEpoch = 0;
+        markConfigDirty();
+      }
     }
 
     fanOn = (fanRunUntil > 0) || heatOn || coolOn;
@@ -386,11 +423,30 @@ void loop() {
     if (now - lastHistLog >= HISTORY_INTERVAL_MS) {
       lastHistLog = now;
       float ctl = !isnan(lastHeatIndexF) ? lastHeatIndexF : lastTempF;
-      histTemp[histIndex] = ctl;
-      histSet[histIndex] = setpointF;
       uint32_t ts = (uint32_t)time(nullptr);
       if (ts == 0) ts = millis() / 1000; // fallback if no NTP yet
-      histTs[histIndex] = ts;
+      lastHistTs = ts;
+      lastHistCtl = ctl;
+      lastHistSetpoint = setpointF;
+      historyDirty = true;
+
+      if (histBaseEpoch == 0 || ts < histBaseEpoch || (ts - histBaseEpoch) > 3600000UL) {
+        histBaseEpoch = ts - (ts % 60);
+        histCount = 0;
+        histIndex = 0;
+      }
+      uint32_t minutes = (ts - histBaseEpoch) / 60;
+      if (minutes > 65535) {
+        histBaseEpoch = ts - (ts % 60);
+        histCount = 0;
+        histIndex = 0;
+        minutes = 0;
+      }
+
+      if (isnan(ctl)) histTemp10[histIndex] = HIST_NA;
+      else histTemp10[histIndex] = (int16_t)lroundf(ctl * 10.0f);
+      histSet10[histIndex] = (int16_t)lroundf(setpointF * 10.0f);
+      histMin[histIndex] = (uint16_t)minutes;
       histIndex = (histIndex + 1) % HIST_MAX;
       if (histCount < HIST_MAX) histCount++;
       // SD append: timestamp, temperature, setpoint
@@ -426,8 +482,8 @@ void loop() {
     }
   }
 
-  handleButtons();
   logHealth();
+  tickCloudSync();
 }
 
 String makeToken() {
@@ -474,8 +530,8 @@ bool requireControlAuth() {
 }
 
 void loadWifiCredentials() {
-  wifiSsid = prefs.getString("ssid", WIFI_SSID);
-  wifiPass = prefs.getString("pass", WIFI_PASSWORD);
+  wifiSsid = prefs.getString("ssid", DEFAULT_WIFI_SSID);
+  wifiPass = prefs.getString("pass", DEFAULT_WIFI_PASSWORD);
 }
 
 bool connectWiFiWithTimeout(unsigned long timeoutMs) {
@@ -493,6 +549,9 @@ bool connectWiFiWithTimeout(unsigned long timeoutMs) {
     WiFi.softAPdisconnect(true);
     configTime(tzOffsetSec, dstOffsetSec, "pool.ntp.org", "time.nist.gov", "time.google.com");
     Serial.printf("\nWiFi connected: %s (%s)\n", WiFi.SSID().c_str(), wifiIpStr.c_str());
+    lastConfigFetch = 0;
+    lastCloudPush = 0;
+    if (configDirty) lastConfigPush = 0;
     return true;
   }
   wifiConnected = false;
@@ -533,6 +592,9 @@ void updateWiFiStatus() {
       WiFi.softAPdisconnect(true);
       configTime(tzOffsetSec, dstOffsetSec, "pool.ntp.org", "time.nist.gov", "time.google.com");
       Serial.printf("WiFi reconnected: %s (%s)\n", WiFi.SSID().c_str(), wifiIpStr.c_str());
+      lastConfigFetch = 0;
+      lastCloudPush = 0;
+      if (configDirty) lastConfigPush = 0;
     }
     return;
   }
@@ -821,10 +883,13 @@ void handleHistoryData() {
   int start = (histIndex - count + HIST_MAX) % HIST_MAX;
   for (int i = 0; i < count; i++) {
     int idx = (start + i) % HIST_MAX;
+    uint32_t ts = histBaseEpoch + ((uint32_t)histMin[idx] * 60UL);
     json += "{";
-    json += "\"ts\":" + String(histTs[idx]) + ",";
-    json += "\"temp\":" + (isnan(histTemp[idx]) ? String("null") : String(histTemp[idx], 2)) + ",";
-    json += "\"set\":" + (isnan(histSet[idx]) ? String("null") : String(histSet[idx], 2));
+    json += "\"ts\":" + String(ts) + ",";
+    if (histTemp10[idx] == HIST_NA) json += "\"temp\":null,";
+    else json += "\"temp\":" + String(((float)histTemp10[idx]) / 10.0f, 2) + ",";
+    if (histSet10[idx] == HIST_NA) json += "\"set\":null";
+    else json += "\"set\":" + String(((float)histSet10[idx]) / 10.0f, 2);
     json += "}";
     if (i < count - 1) json += ",";
   }
@@ -948,6 +1013,9 @@ void handleSet() {
       overrideStartHour = -1;
     }
   }
+  if (updated) {
+    markConfigDirty();
+  }
   String msg = updated ? "Updated" : "No changes";
   server.sendHeader("Location", "/");
   server.send(303, "text/plain", msg);
@@ -964,7 +1032,7 @@ void handleSystemStatus() {
   page += "<div class='detail'>Shows live health for sensors, relays, WiFi, SD, and schedule/manual state.</div>";
   page += "<script>";
   page += "function badge(ok){return `<span class='pill ${ok?'go':'nogo'}'>${ok?'GO':'NO-GO'}</span>`;} ";
-  page += "function load(){fetch('/system_status_data').then(r=>r.json()).then(d=>{const g=document.getElementById('grid');if(!d){g.innerHTML='No data';return;}const rows=[];rows.push(`<div class='tile'><div class='label'>WiFi</div><div class='value'>${badge(d.wifi.ok)} ${d.wifi.ip}</div><div class='detail'>RSSI ${d.wifi.rssi} dBm</div></div>`);rows.push(`<div class='tile'><div class='label'>Sensor</div><div class='value'>${badge(d.sensor.ok)} T: ${d.sensor.temp??'--'} F / H: ${d.sensor.hum??'--'}%</div><div class='detail'>Fresh if reading updated recently.</div></div>`);rows.push(`<div class='tile'><div class='label'>Relays</div><div class='value'>${badge(d.relays.ok)} Heat ${d.relays.heat} | Cool ${d.relays.cool} | Fan ${d.relays.fan}</div><div class='detail'>Mode ${d.mode}</div></div>`);rows.push(`<div class='tile'><div class='label'>Schedule</div><div class='value'>${d.schedule.active?'Scheduled':'Manual'} ${d.schedule.setpoint?d.schedule.setpoint+' F':''}</div><div class='detail'>Override: ${d.schedule.override?'Yes':'No'}</div></div>`);rows.push(`<div class='tile'><div class='label'>SD Card</div><div class='value'>${badge(d.sd.ok)} ${d.sd.type}</div><div class='detail'>Size: ${d.sd.total_bytes ? (d.sd.total_bytes/(1024*1024*1024)).toFixed(2)+' GB' : 'n/a'}</div></div>`);rows.push(`<div class='tile'><div class='label'>Uptime</div><div class='value'>${(d.uptime_s/3600).toFixed(2)} h</div><div class='detail'>${(d.uptime_s/86400).toFixed(2)} days</div></div>`);g.innerHTML=rows.join('');}).catch(()=>{});} load(); setInterval(load, 5000);";
+  page += "function load(){fetch('/system_status_data').then(r=>r.json()).then(d=>{const g=document.getElementById('grid');if(!d){g.innerHTML='No data';return;}const rows=[];rows.push(`<div class='tile'><div class='label'>WiFi</div><div class='value'>${badge(d.wifi.ok)} ${d.wifi.ip}</div><div class='detail'>RSSI ${d.wifi.rssi} dBm</div></div>`);rows.push(`<div class='tile'><div class='label'>Sensor</div><div class='value'>${badge(d.sensor.ok)} T: ${(d.sensor.temp==null?'--':d.sensor.temp)} F / H: ${(d.sensor.hum==null?'--':d.sensor.hum)}%</div><div class='detail'>Fresh if reading updated recently.</div></div>`);rows.push(`<div class='tile'><div class='label'>Relays</div><div class='value'>${badge(d.relays.ok)} Heat ${d.relays.heat} | Cool ${d.relays.cool} | Fan ${d.relays.fan}</div><div class='detail'>Mode ${d.mode}</div></div>`);rows.push(`<div class='tile'><div class='label'>Schedule</div><div class='value'>${d.schedule.active?'Scheduled':'Manual'} ${d.schedule.setpoint?d.schedule.setpoint+' F':''}</div><div class='detail'>Override: ${d.schedule.override?'Yes':'No'}</div></div>`);rows.push(`<div class='tile'><div class='label'>SD Card</div><div class='value'>${badge(d.sd.ok)} ${d.sd.type}</div><div class='detail'>Size: ${d.sd.total_bytes ? (d.sd.total_bytes/(1024*1024*1024)).toFixed(2)+' GB' : 'n/a'}</div></div>`);rows.push(`<div class='tile'><div class='label'>Uptime</div><div class='value'>${(d.uptime_s/3600).toFixed(2)} h</div><div class='detail'>${(d.uptime_s/86400).toFixed(2)} days</div></div>`);g.innerHTML=rows.join('');}).catch(()=>{});} load(); setInterval(load, 5000);";
   page += "</script>";
   page += F("<div class='footer'>Refreshes every 5 seconds; use SD status to confirm logging.</div>");
   page += F("</div></body></html>");
@@ -1022,97 +1090,6 @@ void handleTz() {
   }
 }
 
-void handleButtons() {
-  unsigned long now = millis();
-  bool pressed = false;
-  if (now - lastBtnChange < DEBOUNCE_MS) {
-    lastOk = digitalRead(BTN_OK);
-    lastBack = digitalRead(BTN_BACK);
-    lastUp = digitalRead(BTN_UP);
-    lastDown = digitalRead(BTN_DOWN);
-    return;
-  }
-
-  bool ok   = digitalRead(BTN_OK);
-  bool back = digitalRead(BTN_BACK);
-  bool up   = digitalRead(BTN_UP);
-  bool down = digitalRead(BTN_DOWN);
-
-  bool okPress   = (lastOk == HIGH && ok == LOW);
-  bool backPress = (lastBack == HIGH && back == LOW);
-  bool upPress   = (lastUp == HIGH && up == LOW);
-  bool downPress = (lastDown == HIGH && down == LOW);
-
-  if (okPress) {
-    if (menuState == VIEW) menuState = MENU_MODE;
-    else if (menuState == MENU_MODE) menuState = MENU_SET;
-    else if (menuState == MENU_SET) menuState = MENU_DIFF;
-    else menuState = VIEW;
-    lastBtnChange = now;
-    pressed = true;
-  }
-
-  if (backPress) {
-    menuState = VIEW;
-    lastBtnChange = now;
-    pressed = true;
-  }
-
-  if (upPress) {
-    if (menuState == MENU_MODE) cycleMode(+1);
-    else if (menuState == MENU_SET || menuState == VIEW) setpointF += 0.5f;
-    else if (menuState == MENU_DIFF) {
-      diffF += 0.5f;
-      if (diffF > 10.0f) diffF = 10.0f;
-    }
-    lastBtnChange = now;
-    pressed = true;
-  }
-
-  if (downPress) {
-    if (menuState == MENU_MODE) cycleMode(-1);
-    else if (menuState == MENU_SET || menuState == VIEW) setpointF -= 0.5f;
-    else if (menuState == MENU_DIFF) {
-      diffF -= 0.5f;
-      if (diffF < 0.1f) diffF = 0.1f;
-    }
-    lastBtnChange = now;
-    pressed = true;
-  }
-
-  if (pressed) {
-    if (setpointF < 40) setpointF = 40;
-    if (setpointF > 90) setpointF = 90;
-    mode = modes[modeIndex];
-    overrideUntilNextSchedule = true;
-    struct tm timeinfo;
-    if (getLocalTime(&timeinfo)) {
-      overrideStartHour = timeinfo.tm_hour;
-      lastScheduleHour = overrideStartHour;
-    } else {
-      overrideStartHour = -1;
-    }
-    // Immediate feedback on OLED
-    updateDisplay();
-    if (DEBUG_SERIAL) {
-      Serial.printf("[INPUT] Buttons OK=%d BACK=%d UP=%d DOWN=%d | Mode=%s Set=%.1f Diff=%.1f\n",
-                    okPress ? 1 : 0, backPress ? 1 : 0, upPress ? 1 : 0, downPress ? 1 : 0,
-                    mode.c_str(), setpointF, diffF);
-    }
-  }
-
-  lastOk = ok;
-  lastBack = back;
-  lastUp = up;
-  lastDown = down;
-}
-
-void cycleMode(int dir) {
-  modeIndex = (modeIndex + dir) % 4;
-  if (modeIndex < 0) modeIndex = 3;
-  mode = modes[modeIndex];
-}
-
 void setOutput(int pin, bool on) {
   bool level = RELAY_ACTIVE_HIGH ? on : !on;
   digitalWrite(pin, level);
@@ -1140,55 +1117,24 @@ void updateDisplay() {
     display.display();
     return;
   }
-  if (menuState == VIEW) {
-    display.setCursor(0, 0);
-    display.print("Mode ");
-    display.println(mode);
+  display.setCursor(0, 0);
+  display.print("Mode ");
+  display.println(mode);
 
-    display.setCursor(0, 16);
-    display.print("T: ");
-    display.print(isnan(lastTempF) ? String("--") : String(lastTempF, 1));
-    display.print("F");
+  display.setCursor(0, 16);
+  display.print("T: ");
+  display.print(isnan(lastTempF) ? String("--") : String(lastTempF, 1));
+  display.print("F");
 
-    display.setCursor(0, 32);
-    display.print("RF: ");
-    display.print(isnan(lastHeatIndexF) ? String("--") : String(lastHeatIndexF, 1));
-    display.print("F");
+  display.setCursor(0, 32);
+  display.print("RF: ");
+  display.print(isnan(lastHeatIndexF) ? String("--") : String(lastHeatIndexF, 1));
+  display.print("F");
 
-    display.setCursor(0, 48);
-    display.print("Set ");
-    display.print(String(setpointF, 1));
-    display.print("F");
-  } else if (menuState == MENU_MODE) {
-    display.setCursor(0, 0);
-    display.print("> Mode");
-    display.setCursor(0, 16);
-    display.print(modes[modeIndex]);
-    display.setCursor(0, 32);
-    display.print("Up/Dn change");
-    display.setCursor(0, 48);
-    display.print("OK next  Back exit");
-  } else if (menuState == MENU_SET) {
-    display.setCursor(0, 0);
-    display.print("> Setpoint");
-    display.setCursor(0, 16);
-    display.print(String(setpointF, 1));
-    display.print("F");
-    display.setCursor(0, 32);
-    display.print("Up/Dn adjust");
-    display.setCursor(0, 48);
-    display.print("OK next  Back exit");
-  } else if (menuState == MENU_DIFF) {
-    display.setCursor(0, 0);
-    display.print("> Diff");
-    display.setCursor(0, 16);
-    display.print(String(diffF, 1));
-    display.print("F");
-    display.setCursor(0, 32);
-    display.print("Up/Dn adjust");
-    display.setCursor(0, 48);
-    display.print("OK end  Back exit");
-  }
+  display.setCursor(0, 48);
+  display.print("Set ");
+  display.print(String(setpointF, 1));
+  display.print("F");
   display.display();
 }
 
@@ -1261,11 +1207,6 @@ void logHealth() {
   bool wifiOk = (WiFi.status() == WL_CONNECTED);
   bool sensorFresh = (nowMs - lastRead) < 5000 && !isnan(lastTempF) && !isnan(lastHumidity);
   float ctlTemp = !isnan(lastHeatIndexF) ? lastHeatIndexF : lastTempF;
-  int okBtn = digitalRead(BTN_OK);
-  int backBtn = digitalRead(BTN_BACK);
-  int upBtn = digitalRead(BTN_UP);
-  int downBtn = digitalRead(BTN_DOWN);
-
   if (sdReady) {
     uint8_t type = SD.cardType();
     if (type == CARD_NONE) {
@@ -1292,14 +1233,237 @@ void logHealth() {
                 coolOn ? "ON" : "OFF",
                 fanOn ? "ON" : "OFF",
                 (unsigned long)ESP.getFreeHeap());
-  Serial.printf("[INPUT] ok=%d back=%d up=%d down=%d menu=%d\n",
-                okBtn, backBtn, upBtn, downBtn, (int)menuState);
   Serial.printf("[SD] ready=%d lastWrite=%s err=%s failures=%lu age=%lus\n",
                 sdReady ? 1 : 0,
                 lastSdWriteOk ? "OK" : "FAIL",
                 lastSdError,
                 sdWriteFailures,
                 lastSdWriteMs == 0 ? 0UL : (nowMs - lastSdWriteMs) / 1000UL);
+}
+
+void markConfigDirty() {
+  configDirty = true;
+}
+
+void tickCloudSync() {
+  if (!wifiConnected) return;
+  if (THERMOSTAT_DEVICE_TOKEN_STR[0] == '\0') return;
+  unsigned long now = millis();
+
+  if (configDirty && ((lastConfigPush == 0) || (now - lastConfigPush >= CONFIG_PUSH_INTERVAL_MS))) {
+    if (pushThermostatConfig()) {
+      configDirty = false;
+      lastConfigPush = now;
+    }
+  }
+
+  if ((lastConfigFetch == 0) || (now - lastConfigFetch >= CONFIG_FETCH_INTERVAL_MS)) {
+    if (fetchThermostatConfig()) {
+      lastConfigFetch = now;
+    }
+  }
+
+  if ((lastCloudPush == 0) || (now - lastCloudPush >= CLOUD_PUSH_INTERVAL_MS)) {
+    bool includeHistory = historyDirty;
+    if (pushThermostatStatus(includeHistory)) {
+      lastCloudPush = now;
+      if (includeHistory) historyDirty = false;
+    }
+  }
+}
+
+bool pushThermostatStatus(bool includeHistory) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  if (!http.begin(client, THERMOSTAT_INGEST_ENDPOINT)) return false;
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-Device-Token", THERMOSTAT_DEVICE_TOKEN_STR);
+
+  DynamicJsonDocument doc(2048);
+  uint32_t ts = (uint32_t)time(nullptr);
+  if (ts == 0) ts = millis() / 1000;
+  doc["deviceId"] = THERMOSTAT_DEVICE_ID_STR;
+  doc["ts"] = ts;
+  if (!isnan(lastTempF)) doc["tempF"] = lastTempF;
+  if (!isnan(lastHumidity)) doc["humidity"] = lastHumidity;
+  if (!isnan(lastHeatIndexF)) doc["heatIndexF"] = lastHeatIndexF;
+  doc["setpointF"] = setpointF;
+  doc["diffF"] = diffF;
+  doc["mode"] = mode;
+  doc["heatOn"] = heatOn;
+  doc["coolOn"] = coolOn;
+  doc["fanOn"] = fanOn;
+  doc["fanUntil"] = fanUntilEpoch;
+  doc["ssid"] = WiFi.SSID();
+  doc["rssi"] = WiFi.RSSI();
+  doc["ip"] = wifiIpStr;
+  doc["uptimeSec"] = millis() / 1000;
+  bool sensorOk = (millis() - lastRead) < 5000 && !isnan(lastTempF) && !isnan(lastHumidity);
+  doc["sensorOk"] = sensorOk;
+  doc["sdOk"] = sdReady;
+  if (!lastSdWriteOk && lastSdError) doc["sdError"] = lastSdError;
+
+  bool scheduled = false;
+  float scheduledSp = NAN;
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) {
+    int d = timeinfo.tm_wday;
+    int h = timeinfo.tm_hour;
+    if (d >= 0 && d < 7 && h >= 0 && h < 24) {
+      float sp = scheduleSP[d][h];
+      if (!isnan(sp) && !overrideUntilNextSchedule) {
+        scheduled = true;
+        scheduledSp = sp;
+      }
+    }
+  }
+  doc["scheduleActive"] = scheduled;
+  if (!isnan(scheduledSp)) doc["scheduleSetpoint"] = scheduledSp;
+  doc["overrideActive"] = overrideUntilNextSchedule;
+
+  if (includeHistory && lastHistTs > 0) {
+    JsonArray history = doc.createNestedArray("history");
+    JsonObject point = history.createNestedObject();
+    point["ts"] = lastHistTs;
+    if (!isnan(lastHistCtl)) point["tempF"] = lastHistCtl;
+    if (!isnan(lastHistSetpoint)) point["setpointF"] = lastHistSetpoint;
+  }
+
+  String payload;
+  serializeJson(doc, payload);
+  int code = http.POST(payload);
+  http.end();
+  if (code < 200 || code >= 300) {
+    if (DEBUG_SERIAL) Serial.printf("[CLOUD] Status push failed: %d\n", code);
+    return false;
+  }
+  return true;
+}
+
+bool fetchThermostatConfig() {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  String url = String(THERMOSTAT_CONFIG_ENDPOINT) + "?deviceId=" + THERMOSTAT_DEVICE_ID_STR;
+  if (!http.begin(client, url)) return false;
+  http.addHeader("X-Device-Token", THERMOSTAT_DEVICE_TOKEN_STR);
+  int code = http.GET();
+  if (code != 200) {
+    if (DEBUG_SERIAL) Serial.printf("[CLOUD] Config fetch failed: %d\n", code);
+    http.end();
+    return false;
+  }
+  String payload = http.getString();
+  http.end();
+
+  DynamicJsonDocument doc(12288);
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    if (DEBUG_SERIAL) Serial.printf("[CLOUD] Config parse error: %s\n", err.c_str());
+    return false;
+  }
+  JsonObject config = doc["config"];
+  if (config.isNull()) return false;
+  applyRemoteConfig(config);
+  return true;
+}
+
+bool pushThermostatConfig() {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  if (!http.begin(client, THERMOSTAT_CONFIG_ENDPOINT)) return false;
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-Device-Token", THERMOSTAT_DEVICE_TOKEN_STR);
+
+  DynamicJsonDocument doc(12288);
+  doc["deviceId"] = THERMOSTAT_DEVICE_ID_STR;
+  JsonObject cfg = doc.createNestedObject("config");
+  cfg["setpointF"] = setpointF;
+  cfg["diffF"] = diffF;
+  cfg["mode"] = mode;
+  cfg["fanUntil"] = fanUntilEpoch;
+  JsonArray schedule = cfg.createNestedArray("schedule");
+  for (int d = 0; d < 7; d++) {
+    JsonArray day = schedule.createNestedArray();
+    for (int h = 0; h < 24; h++) {
+      float sp = scheduleSP[d][h];
+      if (isnan(sp)) day.add(nullptr);
+      else day.add(sp);
+    }
+  }
+
+  String payload;
+  serializeJson(doc, payload);
+  int code = http.POST(payload);
+  http.end();
+  if (code < 200 || code >= 300) {
+    if (DEBUG_SERIAL) Serial.printf("[CLOUD] Config push failed: %d\n", code);
+    return false;
+  }
+  return true;
+}
+
+void applyRemoteConfig(JsonObject config) {
+  bool changed = false;
+  float sp = config["setpointF"] | setpointF;
+  sp = constrain(sp, 40.0f, 90.0f);
+  if (fabs(sp - setpointF) > 0.01f) {
+    setpointF = sp;
+    changed = true;
+  }
+
+  float diff = config["diffF"] | diffF;
+  diff = constrain(diff, 0.1f, 10.0f);
+  if (fabs(diff - diffF) > 0.01f) {
+    diffF = diff;
+    changed = true;
+  }
+
+  const char* m = config["mode"];
+  if (m && mode != String(m)) {
+    mode = String(m);
+    changed = true;
+  }
+
+  if (config.containsKey("fanUntil")) {
+    uint32_t remoteFanUntil = (uint32_t)(config["fanUntil"] | 0UL);
+    uint32_t nowEpoch = (uint32_t)time(nullptr);
+    if (remoteFanUntil == 0) {
+      fanUntilEpoch = 0;
+      fanRunUntil = 0;
+    } else if (nowEpoch > 0 && remoteFanUntil >= nowEpoch) {
+      fanUntilEpoch = remoteFanUntil;
+      fanRunUntil = millis() + (unsigned long)(remoteFanUntil - nowEpoch) * 1000UL;
+    }
+  }
+
+  if (config.containsKey("schedule")) {
+    JsonArray days = config["schedule"].as<JsonArray>();
+    if (!days.isNull()) {
+      for (int d = 0; d < 7; d++) {
+        JsonArray hours = days[d].as<JsonArray>();
+        for (int h = 0; h < 24; h++) {
+          if (hours.isNull()) continue;
+          JsonVariant v = hours[h];
+          if (v.isNull()) scheduleSP[d][h] = NAN;
+          else scheduleSP[d][h] = v.as<float>();
+        }
+      }
+    }
+  }
+
+  if (changed) {
+    overrideUntilNextSchedule = true;
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+      overrideStartHour = timeinfo.tm_hour;
+      lastScheduleHour = overrideStartHour;
+    } else {
+      overrideStartHour = -1;
+    }
+  }
 }
 
 

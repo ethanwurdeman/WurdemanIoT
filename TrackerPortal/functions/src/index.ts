@@ -7,6 +7,14 @@ const db = admin.firestore();
 const { Timestamp, FieldValue } = admin.firestore;
 
 const DEVICE_TOKEN = process.env.DEVICE_TOKEN || "";
+const THERMOSTAT_TOKEN = process.env.THERMOSTAT_TOKEN || DEVICE_TOKEN;
+const DEFAULT_THERMOSTAT_CONFIG = {
+  setpointF: 70,
+  diffF: 1,
+  mode: "heat",
+  fanUntil: 0,
+  schedule: [] as Array<Array<number | null>>
+};
 
 const DEFAULT_CONFIG = {
   home: null as { lat: number; lon: number } | null,
@@ -220,6 +228,236 @@ export const config = onRequest(
   }
 );
 
+interface ThermostatIngestRequest {
+  deviceId?: string;
+  ts?: number | string | admin.firestore.Timestamp;
+  tempF?: number | string;
+  humidity?: number | string;
+  heatIndexF?: number | string;
+  setpointF?: number | string;
+  diffF?: number | string;
+  mode?: string;
+  heatOn?: boolean | string | number;
+  coolOn?: boolean | string | number;
+  fanOn?: boolean | string | number;
+  fanUntil?: number | string;
+  ssid?: string;
+  rssi?: number | string;
+  ip?: string;
+  uptimeSec?: number | string;
+  sensorOk?: boolean | string | number;
+  sdOk?: boolean | string | number;
+  sdError?: string;
+  scheduleActive?: boolean | string | number;
+  scheduleSetpoint?: number | string;
+  overrideActive?: boolean | string | number;
+  history?: Array<{ ts?: number | string | admin.firestore.Timestamp; tempF?: number | string; setpointF?: number | string }>;
+  config?: {
+    setpointF?: number | string;
+    diffF?: number | string;
+    mode?: string;
+    fanUntil?: number | string;
+    schedule?: unknown;
+  };
+}
+
+interface ThermostatStatus {
+  ts: admin.firestore.Timestamp;
+  tempF: number | null;
+  humidity: number | null;
+  heatIndexF: number | null;
+  setpointF: number;
+  diffF: number;
+  mode: string;
+  heatOn: boolean;
+  coolOn: boolean;
+  fanOn: boolean;
+  fanUntil: number;
+  wifi: { ssid: string | null; rssi: number | null; ip: string | null };
+  uptimeSec: number;
+  sensorOk: boolean;
+  sdOk: boolean;
+  sdError: string | null;
+  scheduleActive: boolean;
+  scheduleSetpoint: number | null;
+  overrideActive: boolean;
+}
+
+interface ThermostatHistoryPoint {
+  ts: admin.firestore.Timestamp;
+  tempF: number | null;
+  setpointF: number | null;
+}
+
+interface ThermostatConfigShape {
+  setpointF: number;
+  diffF: number;
+  mode: string;
+  fanUntil: number;
+  schedule: Array<Array<number | null>>;
+}
+
+export const thermostatIngest = onRequest(
+  {
+    cors: true,
+    region: "us-central1",
+    concurrency: 8
+  },
+  async (req, res) => {
+    res.set("Access-Control-Allow-Origin", "*");
+    res.set("Access-Control-Allow-Headers", "Content-Type, X-Device-Token");
+
+    if (req.method === "OPTIONS") {
+      res.status(204).send("");
+      return;
+    }
+
+    if (req.method !== "POST") {
+      res.set("Allow", "POST");
+      res.status(405).json({ error: "Method not allowed" });
+      return;
+    }
+
+    if (!THERMOSTAT_TOKEN) {
+      logger.error("THERMOSTAT_TOKEN env var not set");
+      res.status(500).json({ error: "Server auth not configured" });
+      return;
+    }
+
+    const token = (req.get("X-Device-Token") || req.get("x-device-token") || "").trim();
+    if (!token || token !== THERMOSTAT_TOKEN) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    const body = (req.body ?? {}) as ThermostatIngestRequest;
+    const deviceId = (body.deviceId || "").trim();
+    if (!deviceId) {
+      res.status(400).json({ error: "Missing deviceId" });
+      return;
+    }
+
+    const status = normalizeThermostatStatus(body);
+    const history = normalizeThermostatHistory(body);
+
+    try {
+      const ref = db.collection("thermostats").doc(deviceId);
+      const snap = await ref.get();
+      const existing = snap.exists ? snap.data() : undefined;
+      const existingConfig = normalizeThermostatConfig(existing?.config);
+
+      const update: Record<string, unknown> = {
+        name: existing?.name ?? deviceId,
+        updatedAt: FieldValue.serverTimestamp(),
+        status
+      };
+      if (!existing?.config) {
+        update.config = existingConfig;
+      }
+
+      const batch = db.batch();
+      batch.set(ref, update, { merge: true });
+      history.forEach((point) => {
+        const id = String(point.ts.toMillis());
+        const histRef = ref.collection("history").doc(id);
+        batch.set(histRef, point, { merge: true });
+      });
+      await batch.commit();
+
+      res.status(200).json({ status: "ok", deviceId });
+      return;
+    } catch (err) {
+      logger.error("Thermostat ingest failure", err as Error);
+      res.status(500).json({ error: "Failed to ingest thermostat data" });
+      return;
+    }
+  }
+);
+
+export const thermostatConfig = onRequest(
+  {
+    cors: true,
+    region: "us-central1"
+  },
+  async (req, res) => {
+    res.set("Access-Control-Allow-Origin", "*");
+    res.set("Access-Control-Allow-Headers", "Content-Type, X-Device-Token");
+
+    if (req.method === "OPTIONS") {
+      res.status(204).send("");
+      return;
+    }
+
+    if (!THERMOSTAT_TOKEN) {
+      logger.error("THERMOSTAT_TOKEN env var not set");
+      res.status(500).json({ error: "Server auth not configured" });
+      return;
+    }
+
+    const token = (req.get("X-Device-Token") || req.get("x-device-token") || "").trim();
+    if (!token || token !== THERMOSTAT_TOKEN) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    if (req.method === "GET") {
+      const deviceId = ((req.query.deviceId as string) || "").trim();
+      if (!deviceId) {
+        res.status(400).json({ error: "Missing deviceId" });
+        return;
+      }
+
+      try {
+        const ref = db.collection("thermostats").doc(deviceId);
+        const snap = await ref.get();
+        const data = snap.data();
+        const configValue = normalizeThermostatConfig(data?.config);
+        res.status(200).json({
+          deviceId,
+          config: configValue,
+          serverTime: Date.now()
+        });
+        return;
+      } catch (err) {
+        logger.error("Thermostat config fetch failed", err as Error);
+        res.status(500).json({ error: "Failed to load thermostat config" });
+        return;
+      }
+    }
+
+    if (req.method === "POST") {
+      const body = (req.body ?? {}) as ThermostatIngestRequest;
+      const deviceId = (body.deviceId || "").trim();
+      if (!deviceId) {
+        res.status(400).json({ error: "Missing deviceId" });
+        return;
+      }
+      try {
+        const ref = db.collection("thermostats").doc(deviceId);
+        const snap = await ref.get();
+        const existing = snap.exists ? snap.data() : undefined;
+        const merged = normalizeThermostatConfig(body.config, existing?.config);
+        await ref.set(
+          {
+            config: merged,
+            configUpdatedAt: FieldValue.serverTimestamp()
+          },
+          { merge: true }
+        );
+        res.status(200).json({ status: "ok", deviceId });
+        return;
+      } catch (err) {
+        logger.error("Thermostat config update failed", err as Error);
+        res.status(500).json({ error: "Failed to update thermostat config" });
+        return;
+      }
+    }
+
+    res.set("Allow", "GET, POST");
+    res.status(405).json({ error: "Method not allowed" });
+  }
+);
+
 function normalizePoints(body: IngestRequest): NormalizedPoint[] {
   const rawPoints = Array.isArray(body.points) ? body.points : [body];
   const valid: NormalizedPoint[] = [];
@@ -410,4 +648,108 @@ function parseMonthStart(value: unknown): string | null {
   }
   if (value instanceof Date) return currentMonthKey(value);
   return null;
+}
+
+function normalizeThermostatStatus(body: ThermostatIngestRequest): ThermostatStatus {
+  const ts = parseTimestamp(body.ts) ?? Timestamp.fromMillis(Date.now());
+  return {
+    ts,
+    tempF: toNullableNumber(body.tempF),
+    humidity: toNullableNumber(body.humidity),
+    heatIndexF: toNullableNumber(body.heatIndexF),
+    setpointF: toNumber(body.setpointF, DEFAULT_THERMOSTAT_CONFIG.setpointF),
+    diffF: toNumber(body.diffF, DEFAULT_THERMOSTAT_CONFIG.diffF),
+    mode: normalizeThermostatMode(body.mode ?? DEFAULT_THERMOSTAT_CONFIG.mode),
+    heatOn: toBoolean(body.heatOn, false),
+    coolOn: toBoolean(body.coolOn, false),
+    fanOn: toBoolean(body.fanOn, false),
+    fanUntil: toNumber(body.fanUntil, DEFAULT_THERMOSTAT_CONFIG.fanUntil),
+    wifi: {
+      ssid: body.ssid ? String(body.ssid) : null,
+      rssi: toNullableNumber(body.rssi),
+      ip: body.ip ? String(body.ip) : null
+    },
+    uptimeSec: toNumber(body.uptimeSec, 0),
+    sensorOk: toBoolean(body.sensorOk, false),
+    sdOk: toBoolean(body.sdOk, false),
+    sdError: body.sdError ? String(body.sdError) : null,
+    scheduleActive: toBoolean(body.scheduleActive, false),
+    scheduleSetpoint: toNullableNumber(body.scheduleSetpoint),
+    overrideActive: toBoolean(body.overrideActive, false)
+  };
+}
+
+function normalizeThermostatHistory(body: ThermostatIngestRequest): ThermostatHistoryPoint[] {
+  const points: ThermostatHistoryPoint[] = [];
+  const history = Array.isArray(body.history) ? body.history : [];
+  history.forEach((raw) => {
+    const ts = parseTimestamp(raw.ts);
+    if (!ts) return;
+    const tempF = toNullableNumber(raw.tempF);
+    const setpointF = toNullableNumber(raw.setpointF);
+    points.push({ ts, tempF, setpointF });
+  });
+
+  if (!points.length) {
+    const ts = parseTimestamp(body.ts);
+    const tempF = toNullableNumber(body.tempF);
+    const setpointF = toNullableNumber(body.setpointF);
+    if (ts && (tempF !== null || setpointF !== null)) {
+      points.push({ ts, tempF, setpointF });
+    }
+  }
+
+  return points;
+}
+
+function normalizeThermostatConfig(
+  input: unknown,
+  fallback?: unknown
+): ThermostatConfigShape {
+  const base = (fallback || DEFAULT_THERMOSTAT_CONFIG) as ThermostatConfigShape;
+  const cfg = (input || {}) as Record<string, unknown>;
+  return {
+    setpointF: toNumber(cfg.setpointF, base.setpointF),
+    diffF: toNumber(cfg.diffF, base.diffF),
+    mode: normalizeThermostatMode(cfg.mode ?? base.mode),
+    fanUntil: toNumber(cfg.fanUntil, base.fanUntil),
+    schedule: normalizeThermostatSchedule(cfg.schedule, base.schedule)
+  };
+}
+
+function normalizeThermostatSchedule(
+  input: unknown,
+  fallback?: Array<Array<number | null>>
+): Array<Array<number | null>> {
+  const out: Array<Array<number | null>> = [];
+  const source = Array.isArray(input) ? input : Array.isArray(fallback) ? fallback : [];
+  for (let d = 0; d < 7; d++) {
+    const row: Array<number | null> = [];
+    const day = Array.isArray(source[d]) ? (source[d] as unknown[]) : [];
+    for (let h = 0; h < 24; h++) {
+      const value = toNullableNumber(day[h]);
+      row.push(Number.isFinite(value) ? value : null);
+    }
+    out.push(row);
+  }
+  return out;
+}
+
+function normalizeThermostatMode(raw: unknown): string {
+  const value = String(raw || "").toLowerCase();
+  if (value === "heat" || value === "cool" || value === "fan" || value === "off") {
+    return value;
+  }
+  return DEFAULT_THERMOSTAT_CONFIG.mode;
+}
+
+function toBoolean(value: unknown, fallback = false): boolean {
+  if (value === true || value === false) return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") {
+    const v = value.trim().toLowerCase();
+    if (v === "true" || v === "1" || v === "yes" || v === "on") return true;
+    if (v === "false" || v === "0" || v === "no" || v === "off") return false;
+  }
+  return fallback;
 }

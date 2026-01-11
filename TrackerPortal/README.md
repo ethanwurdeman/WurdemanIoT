@@ -11,7 +11,7 @@ Single-page Firebase Hosting app for the WurdemanIoT control center plus Cloud F
 ## Routes
 - `#/home`: device grid with online/stale indicators and deep links.
 - `#/dog/{deviceId}`: live last-location listener, config controls (geofence, ping cadence, force roam), day selector + scrubber, and history polyline.
-- `#/thermostat`: embedded device UI (enter the thermostat URL).
+- `#/thermostat`: Firebase-backed thermostat status, controls, schedule, and history.
 
 ## Firestore data model
 - `devices/{deviceId}`:
@@ -27,6 +27,9 @@ Single-page Firebase Hosting app for the WurdemanIoT control center plus Cloud F
 - Device token (Tyee): `b7c9e2a41fd64e7d9f13c8a5`
 - POST `/ingest`: accepts single point or `{ points: [] }` batch, applies defaults, updates `last`, appends to `points`, and maintains `counters`.
 - GET `/config?deviceId=...`: returns config with defaults applied plus counters/last snapshot.
+- Thermostat endpoints: `https://us-central1-wurdemaniot.cloudfunctions.net/thermostatIngest` and `/thermostatConfig`.
+- POST `/thermostatIngest`: accepts current status and optional history point(s), updates `thermostats/{deviceId}`.
+- GET `/thermostatConfig?deviceId=...`: returns thermostat config; POST updates config (device-authenticated).
 
 ## Setup
 1) Fill `public/firebase-config.js` with your Firebase web config.

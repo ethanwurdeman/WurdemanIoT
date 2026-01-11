@@ -37,7 +37,9 @@ const DEFAULT_CONFIG = {
 const HISTORY_LIMIT = 2000;
 const HISTORY_RENDER_LIMIT = 200;
 const DEFAULT_WINDOW_MINUTES = 60;
-const THERMOSTAT_STORAGE_KEY = "thermostat.baseUrl";
+const DEFAULT_THERMOSTAT_ID = ingestConfig?.thermostatId || "home";
+const THERMOSTAT_HISTORY_LIMIT = 2000;
+const THERMOSTAT_HISTORY_RENDER_LIMIT = 400;
 
 const state = {
   user: null,
@@ -54,7 +56,12 @@ const state = {
   historyPoints: [],
   currentConfig: null,
   lastSnapshot: null,
-  thermostatLoadTimeout: null,
+  thermostatUnsub: null,
+  thermostatHistoryTimer: null,
+  thermostatId: DEFAULT_THERMOSTAT_ID,
+  thermostat: null,
+  thermostatHistory: [],
+  thermostatRange: "day",
   debug: {
     deviceError: null,
     devicesError: null,
@@ -187,127 +194,584 @@ function renderComingSoon(label) {
 
 function renderThermostat() {
   cleanupListeners();
+  const canEdit = !!state.user;
   view.innerHTML = `
     <div class="section-header">
       <div>
         <h2>Thermostat</h2>
-        <p class="muted">Load the device web UI from your local network.</p>
+        <p class="muted">Live status and controls synced with Firebase.</p>
+        <div class="muted" id="thermo-auth">${canEdit ? "" : "Sign in to change settings."}</div>
       </div>
-      <span class="pill offline" id="thermo-conn-pill"><span class="dot"></span>Device: -</span>
+      <span class="pill offline" id="thermo-status-pill"><span class="dot"></span>Offline</span>
     </div>
 
-    <div class="card thermo-card">
-      <div class="thermo-config">
-        <label>
-          Thermostat URL
-          <input type="text" id="thermo-url" placeholder="http://192.168.1.50">
-        </label>
-        <div class="thermo-actions">
-          <button class="btn" type="button" id="thermo-load-btn">Load UI</button>
-          <button class="btn ghost" type="button" id="thermo-open-btn">Open in new tab</button>
+    <div class="thermo-grid">
+      <div class="card thermo-panel">
+        <div class="thermo-metric">
+          <div class="thermo-label">Temperature</div>
+          <div class="thermo-value" id="thermo-temp">--</div>
+          <div class="thermo-sub">Real feel: <span id="thermo-feel">--</span></div>
+          <div class="thermo-sub">Humidity: <span id="thermo-hum">--</span></div>
         </div>
-        <div class="muted" id="thermo-hint">Tip: use the device IP or hostname (example: http://192.168.1.50).</div>
+        <div class="thermo-meta" id="thermo-meta">Last update: --</div>
+        <div class="thermo-chip-row">
+          <span class="pill" id="thermo-mode-pill"><span class="dot"></span>Mode: --</span>
+          <span class="pill" id="thermo-output-pill"><span class="dot"></span>Outputs: --</span>
+        </div>
+        <div class="thermo-sub" id="thermo-schedule-status">Schedule: --</div>
+        <div class="thermo-sub" id="thermo-wifi">WiFi: --</div>
+        <div class="thermo-sub" id="thermo-sd">SD: --</div>
+      </div>
+
+      <div class="card thermo-panel">
+        <div class="thermo-control-row">
+          <div class="thermo-label">Setpoint (&deg;F)</div>
+          <div class="thermo-control-group">
+            <button class="btn ghost" type="button" id="thermo-set-down">-</button>
+            <div class="thermo-control-value" id="thermo-setpoint">--</div>
+            <button class="btn" type="button" id="thermo-set-up">+</button>
+          </div>
+        </div>
+        <div class="thermo-control-row">
+          <div class="thermo-label">Diff (&deg;F)</div>
+          <div class="thermo-control-group">
+            <button class="btn ghost" type="button" id="thermo-diff-down">-</button>
+            <div class="thermo-control-value" id="thermo-diff">--</div>
+            <button class="btn" type="button" id="thermo-diff-up">+</button>
+          </div>
+        </div>
+        <div class="thermo-control-row">
+          <div class="thermo-label">Mode</div>
+          <div class="thermo-mode-buttons" id="thermo-mode-buttons">
+            <button class="btn ghost" type="button" data-mode="heat">Heat</button>
+            <button class="btn ghost" type="button" data-mode="cool">Cool</button>
+            <button class="btn ghost" type="button" data-mode="fan">Fan</button>
+            <button class="btn ghost" type="button" data-mode="off">Off</button>
+          </div>
+        </div>
+        <div class="thermo-control-row">
+          <div class="thermo-label">Fan timer</div>
+          <div class="thermo-control-group">
+            <button class="btn ghost" type="button" id="thermo-fan-start">Start</button>
+            <button class="btn ghost" type="button" id="thermo-fan-clear">Clear</button>
+          </div>
+          <div class="thermo-sub" id="thermo-fan-status">--</div>
+        </div>
       </div>
     </div>
 
-    <div class="card thermo-frame-card">
+    <div class="card thermo-panel">
       <div class="section-header">
-        <h3>Thermostat UI</h3>
-        <span class="muted" id="thermo-status">Waiting for device URL.</span>
+        <h3>Schedule</h3>
+        <div class="thermo-schedule-actions">
+          <button class="btn ghost" type="button" id="thermo-schedule-refresh">Refresh</button>
+          <button class="btn ghost" type="button" id="thermo-schedule-clear">Clear all</button>
+        </div>
       </div>
-      <div class="thermo-frame-wrap">
-        <iframe id="thermo-frame" title="Thermostat UI" src="about:blank" loading="lazy"></iframe>
+      <div class="thermo-schedule-legend">Long-press a day bar to add a setpoint block.</div>
+      <div id="thermo-schedule-grid"></div>
+      <div class="muted">Blocks are inclusive of the end hour.</div>
+    </div>
+
+    <div class="card thermo-panel">
+      <div class="section-header">
+        <h3>History</h3>
+        <div class="thermo-history-actions">
+          <button class="btn ghost" type="button" data-range="day">Day</button>
+          <button class="btn ghost" type="button" data-range="week">Week</button>
+          <button class="btn ghost" type="button" data-range="month">Month</button>
+          <button class="btn ghost" type="button" id="thermo-history-refresh">Refresh</button>
+        </div>
+      </div>
+      <canvas id="thermo-chart" width="900" height="360"></canvas>
+      <div class="thermo-history-legend">
+        <span><span class="thermo-swatch" style="background:#2f74ff"></span>Setpoint</span>
+        <span><span class="thermo-swatch" style="background:#30d158"></span>Temperature</span>
       </div>
     </div>
   `;
 
-  const urlInput = document.getElementById("thermo-url");
-  const loadBtn = document.getElementById("thermo-load-btn");
-  const openBtn = document.getElementById("thermo-open-btn");
-  const frame = document.getElementById("thermo-frame");
-  const statusEl = document.getElementById("thermo-status");
-  const pill = document.getElementById("thermo-conn-pill");
+  bindThermostatControls();
+  subscribeThermostat();
+  loadThermostatHistory(state.thermostatRange);
+  state.thermostatHistoryTimer = setInterval(() => {
+    loadThermostatHistory(state.thermostatRange);
+  }, 60000);
+}
 
-  const savedUrl = getThermostatUrl();
-  if (urlInput && savedUrl) {
-    urlInput.value = savedUrl;
-  }
+function bindThermostatControls() {
+  const setDown = document.getElementById("thermo-set-down");
+  const setUp = document.getElementById("thermo-set-up");
+  const diffDown = document.getElementById("thermo-diff-down");
+  const diffUp = document.getElementById("thermo-diff-up");
+  const modeButtons = document.getElementById("thermo-mode-buttons");
+  const fanStart = document.getElementById("thermo-fan-start");
+  const fanClear = document.getElementById("thermo-fan-clear");
+  const scheduleRefresh = document.getElementById("thermo-schedule-refresh");
+  const scheduleClear = document.getElementById("thermo-schedule-clear");
+  const historyRefresh = document.getElementById("thermo-history-refresh");
+  const historyButtons = document.querySelectorAll(".thermo-history-actions button[data-range]");
 
-  function setPill(state, label) {
-    if (!pill) return;
-    pill.className = `pill ${state}`;
-    pill.innerHTML = `<span class="dot"></span>${label}`;
-  }
-
-  function loadThermostatUi() {
-    if (!urlInput || !frame || !statusEl) return;
-    const normalized = normalizeThermostatUrl(urlInput.value);
-    if (!normalized) {
-      statusEl.textContent = "Enter a device URL to load the UI.";
-      setPill("offline", "Device: not set");
-      frame.src = "about:blank";
-      return;
+  const canEdit = !!state.user;
+  const disableEls = [
+    setDown,
+    setUp,
+    diffDown,
+    diffUp,
+    modeButtons,
+    fanStart,
+    fanClear,
+    scheduleClear
+  ];
+  disableEls.forEach((el) => {
+    if (!el) return;
+    if (el.tagName === "BUTTON") {
+      el.disabled = !canEdit;
+    } else {
+      el.querySelectorAll("button").forEach((btn) => {
+        btn.disabled = !canEdit;
+      });
     }
-    setThermostatUrl(normalized);
-    const target = `${normalized}/thermostat`;
-    statusEl.textContent = `Loading ${target} ...`;
-    setPill("stale", `Device: ${normalized}`);
-    frame.src = target;
-    if (state.thermostatLoadTimeout) {
-      clearTimeout(state.thermostatLoadTimeout);
+  });
+
+  if (setDown) setDown.onclick = () => adjustThermostatConfig("setpointF", -0.5, 40, 90);
+  if (setUp) setUp.onclick = () => adjustThermostatConfig("setpointF", 0.5, 40, 90);
+  if (diffDown) diffDown.onclick = () => adjustThermostatConfig("diffF", -0.5, 0.1, 10);
+  if (diffUp) diffUp.onclick = () => adjustThermostatConfig("diffF", 0.5, 0.1, 10);
+
+  if (modeButtons) {
+    modeButtons.querySelectorAll("button").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const mode = btn.getAttribute("data-mode");
+        if (!mode) return;
+        updateThermostatConfig({ mode });
+      });
+    });
+  }
+
+  if (fanStart) {
+    fanStart.onclick = () => {
+      if (!requireThermostatAuth("start fan timer")) return;
+      const value = prompt("Fan runtime minutes (0-60)", "10");
+      if (value == null) return;
+      const minutes = Math.max(0, Math.min(60, Number(value) || 0));
+      const now = Date.now();
+      const fanUntil = minutes ? Math.floor((now + minutes * 60000) / 1000) : 0;
+      updateThermostatConfig({ fanUntil });
+    };
+  }
+  if (fanClear) {
+    fanClear.onclick = () => updateThermostatConfig({ fanUntil: 0 });
+  }
+
+  if (scheduleRefresh) {
+    scheduleRefresh.onclick = () => renderThermostatSchedule(state.thermostat?.config?.schedule);
+  }
+  if (scheduleClear) {
+    scheduleClear.onclick = () => clearThermostatSchedule();
+  }
+
+  if (historyRefresh) {
+    historyRefresh.onclick = () => loadThermostatHistory(state.thermostatRange);
+  }
+  historyButtons.forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const range = btn.getAttribute("data-range") || "day";
+      state.thermostatRange = range;
+      loadThermostatHistory(range);
+    });
+  });
+}
+
+function requireThermostatAuth(actionLabel) {
+  if (state.user) return true;
+  const note = document.getElementById("thermo-auth");
+  if (note) note.textContent = `Sign in required to ${actionLabel}.`;
+  return false;
+}
+
+async function updateThermostatConfig(partial) {
+  if (!requireThermostatAuth("update thermostat config")) return;
+  const ref = doc(db, "thermostats", state.thermostatId);
+  await setDoc(ref, { config: partial }, { merge: true });
+}
+
+function adjustThermostatConfig(field, delta, min, max) {
+  if (!requireThermostatAuth("update thermostat config")) return;
+  const current = Number(state.thermostat?.config?.[field] ?? 0);
+  const next = Math.min(Math.max(current + delta, min), max);
+  updateThermostatConfig({ [field]: Number(next.toFixed(1)) });
+}
+
+function subscribeThermostat() {
+  const ref = doc(db, "thermostats", state.thermostatId);
+  state.thermostatUnsub = onSnapshot(
+    ref,
+    (snap) => {
+      if (!snap.exists()) {
+        state.thermostat = null;
+        updateThermostatUI(null);
+        return;
+      }
+      state.thermostat = snap.data();
+      updateThermostatUI(state.thermostat);
+    },
+    (err) => {
+      console.error("Thermostat listener error", err);
+      updateThermostatUI(null);
     }
-    state.thermostatLoadTimeout = setTimeout(() => {
-      if (statusEl.textContent.startsWith("Loading")) {
-        statusEl.textContent = "Still loading... check network or device URL.";
-        setPill("stale", `Device: ${normalized}`);
-      }
-    }, 8000);
+  );
+}
+
+function updateThermostatUI(data) {
+  const pill = document.getElementById("thermo-status-pill");
+  const tempEl = document.getElementById("thermo-temp");
+  const feelEl = document.getElementById("thermo-feel");
+  const humEl = document.getElementById("thermo-hum");
+  const metaEl = document.getElementById("thermo-meta");
+  const modePill = document.getElementById("thermo-mode-pill");
+  const outputPill = document.getElementById("thermo-output-pill");
+  const scheduleEl = document.getElementById("thermo-schedule-status");
+  const wifiEl = document.getElementById("thermo-wifi");
+  const sdEl = document.getElementById("thermo-sd");
+  const setpointEl = document.getElementById("thermo-setpoint");
+  const diffEl = document.getElementById("thermo-diff");
+  const fanStatus = document.getElementById("thermo-fan-status");
+
+  if (!data) {
+    if (pill) {
+      pill.className = "pill offline";
+      pill.innerHTML = `<span class="dot"></span>Offline`;
+    }
+    if (tempEl) tempEl.textContent = "--";
+    if (feelEl) feelEl.textContent = "--";
+    if (humEl) humEl.textContent = "--";
+    if (metaEl) metaEl.textContent = "Last update: --";
+    if (modePill) modePill.innerHTML = `<span class="dot"></span>Mode: --`;
+    if (outputPill) outputPill.innerHTML = `<span class="dot"></span>Outputs: --`;
+    if (scheduleEl) scheduleEl.textContent = "Schedule: --";
+    if (wifiEl) wifiEl.textContent = "WiFi: --";
+    if (sdEl) sdEl.textContent = "SD: --";
+    if (setpointEl) setpointEl.textContent = "--";
+    if (diffEl) diffEl.textContent = "--";
+    if (fanStatus) fanStatus.textContent = "--";
+    renderThermostatSchedule([]);
+    return;
   }
 
-  if (loadBtn) {
-    loadBtn.addEventListener("click", loadThermostatUi);
-  }
-  if (openBtn) {
-    openBtn.addEventListener("click", () => {
-      if (!urlInput) return;
-      const normalized = normalizeThermostatUrl(urlInput.value);
-      if (!normalized) return;
-      window.open(`${normalized}/thermostat`, "_blank", "noopener");
-    });
-  }
-  if (urlInput) {
-    urlInput.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") {
-        e.preventDefault();
-        loadThermostatUi();
-      }
-    });
-  }
-  if (frame) {
-    frame.addEventListener("load", () => {
-      if (!statusEl || !urlInput) return;
-      if (frame.src === "about:blank") return;
-      if (state.thermostatLoadTimeout) {
-        clearTimeout(state.thermostatLoadTimeout);
-        state.thermostatLoadTimeout = null;
-      }
-      const normalized = normalizeThermostatUrl(urlInput.value);
-      statusEl.textContent = normalized
-        ? `Loaded ${normalized}/thermostat`
-        : "Loaded device UI.";
-      setPill("online", `Device: ${normalized || "unknown"}`);
-    });
-    frame.addEventListener("error", () => {
-      if (!statusEl) return;
-      statusEl.textContent = "Failed to load device UI.";
-      setPill("offline", "Device: unreachable");
-    });
+  const status = data.status || {};
+  const config = data.config || {};
+  const updatedAt = toDate(status.ts) || toDate(data.updatedAt);
+  const ageMs = updatedAt ? Date.now() - updatedAt.getTime() : null;
+  const online = ageMs != null && ageMs < 2 * 60 * 1000;
+  const stale = ageMs != null && ageMs < 10 * 60 * 1000;
+
+  if (pill) {
+    pill.className = `pill ${online ? "online" : stale ? "stale" : "offline"}`;
+    pill.innerHTML = `<span class="dot"></span>${online ? "Online" : stale ? "Stale" : "Offline"}`;
   }
 
-  if (savedUrl) {
-    loadThermostatUi();
-  } else {
-    setPill("offline", "Device: not set");
+  const temp = status.tempF ?? null;
+  const feel = status.heatIndexF ?? null;
+  const hum = status.humidity ?? null;
+  if (tempEl) tempEl.textContent = temp != null ? `${Number(temp).toFixed(1)} F` : "--";
+  if (feelEl) feelEl.textContent = feel != null ? `${Number(feel).toFixed(1)} F` : "--";
+  if (humEl) humEl.textContent = hum != null ? `${Number(hum).toFixed(0)} %` : "--";
+
+  if (metaEl) {
+    metaEl.textContent = updatedAt ? `Last update: ${formatDate(updatedAt)}` : "Last update: --";
+  }
+
+  const mode = (status.mode || config.mode || "--").toString();
+  if (modePill) {
+    modePill.className = `pill ${thermostatModeClass(mode)}`;
+    modePill.innerHTML = `<span class="dot"></span>Mode: ${mode}`;
+  }
+
+  const outputs = `Heat ${status.heatOn ? "ON" : "OFF"} | Cool ${status.coolOn ? "ON" : "OFF"} | Fan ${status.fanOn ? "ON" : "OFF"}`;
+  if (outputPill) outputPill.innerHTML = `<span class="dot"></span>${outputs}`;
+
+  if (scheduleEl) {
+    const schedLabel = status.scheduleActive ? "Scheduled" : "Manual";
+    const schedValue = status.scheduleSetpoint != null ? `${Number(status.scheduleSetpoint).toFixed(1)} F` : "";
+    scheduleEl.textContent = `Schedule: ${schedLabel}${schedValue ? ` (${schedValue})` : ""}`;
+  }
+
+  const wifi = status.wifi || {};
+  const wifiParts = [];
+  if (wifi.ssid) wifiParts.push(wifi.ssid);
+  if (wifi.ip) wifiParts.push(wifi.ip);
+  if (wifi.rssi != null) wifiParts.push(`${wifi.rssi} dBm`);
+  if (wifiEl) wifiEl.textContent = wifiParts.length ? `WiFi: ${wifiParts.join(" | ")}` : "WiFi: --";
+
+  if (sdEl) {
+    const sdOk = status.sdOk ? "OK" : "NO";
+    const sdErr = status.sdError ? ` (${status.sdError})` : "";
+    sdEl.textContent = `SD: ${sdOk}${sdErr}`;
+  }
+
+  if (setpointEl) {
+    const sp = config.setpointF ?? status.setpointF;
+    setpointEl.textContent = sp != null ? Number(sp).toFixed(1) : "--";
+  }
+  if (diffEl) {
+    const diff = config.diffF ?? status.diffF;
+    diffEl.textContent = diff != null ? Number(diff).toFixed(1) : "--";
+  }
+
+  if (fanStatus) {
+    const fanUntil = config.fanUntil ?? status.fanUntil ?? 0;
+    if (fanUntil && Number(fanUntil) > 0) {
+      const untilDate = new Date(Number(fanUntil) * 1000);
+      fanStatus.textContent = `Running until ${formatTimeOfDay(untilDate)}`;
+    } else {
+      fanStatus.textContent = "Not running";
+    }
+  }
+
+  const modeButtons = document.querySelectorAll("#thermo-mode-buttons button");
+  modeButtons.forEach((btn) => {
+    const btnMode = btn.getAttribute("data-mode");
+    btn.classList.toggle("active", btnMode === mode);
+  });
+
+  renderThermostatSchedule(config.schedule);
+}
+
+function renderThermostatSchedule(rawSchedule) {
+  const schedule = normalizeThermostatSchedule(rawSchedule);
+  const canEdit = !!state.user;
+  const wrap = document.getElementById("thermo-schedule-grid");
+  if (!wrap) return;
+
+  const dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const dayOrder = [1, 2, 3, 4, 5, 6, 0];
+
+  wrap.innerHTML = "";
+  let pressTimer = null;
+
+  function cancelPress() {
+    if (pressTimer) {
+      clearTimeout(pressTimer);
+      pressTimer = null;
+    }
+  }
+
+  function startPress(ev, dayIdx, bar) {
+    if (!canEdit) return;
+    cancelPress();
+    pressTimer = setTimeout(() => {
+      pressTimer = null;
+      createBlock(ev, dayIdx, bar);
+    }, 500);
+  }
+
+  function createBlock(ev, dayIdx, bar) {
+    const rect = bar.getBoundingClientRect();
+    const pct = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
+    const start = Math.floor(pct * 24);
+    const duration = parseInt(prompt(`Duration hours (1-24) starting at ${start}:00`, "2") || "0", 10);
+    if (!duration || duration < 1 || duration > 24) return;
+    const end = (start + duration - 1) % 24;
+    const sp = parseFloat(prompt("Setpoint (F)", "70") || "70");
+    applyScheduleBlock(dayIdx, start, end, sp);
+  }
+
+  function addSeg(bar, start, end, sp) {
+    if (start < 0 || end < start) return;
+    const seg = document.createElement("div");
+    const left = (start / 24) * 100;
+    const width = ((end - start + 1) / 24) * 100;
+    seg.className = "thermo-seg";
+    seg.style.left = `${left}%`;
+    seg.style.width = `${width}%`;
+    seg.style.background = "#2f74ff";
+    seg.innerHTML = `<span>${sp.toFixed(0)} F</span>`;
+    bar.appendChild(seg);
+  }
+
+  dayOrder.forEach((dayIdx, displayIdx) => {
+    const hours = schedule[dayIdx];
+    const row = document.createElement("div");
+    row.className = "thermo-day-row";
+    row.innerHTML = `<div class="thermo-day-name">${dayNames[displayIdx]}</div><div class="thermo-day-bar" data-day="${dayIdx}"></div>`;
+    const bar = row.querySelector(".thermo-day-bar");
+    bar.addEventListener("pointerdown", (e) => startPress(e, dayIdx, bar));
+    bar.addEventListener("pointerup", cancelPress);
+    bar.addEventListener("pointerleave", cancelPress);
+
+    let start = -1;
+    let lastSp = null;
+    for (let h = 0; h < 25; h++) {
+      const sp = h < 24 ? hours[h] : null;
+      if (sp != null && lastSp == null) {
+        start = h;
+        lastSp = sp;
+      } else if ((sp == null && lastSp != null) || (sp != null && lastSp != null && Math.abs(sp - lastSp) > 0.01)) {
+        addSeg(bar, start, h - 1, lastSp);
+        start = sp == null ? -1 : h;
+        lastSp = sp;
+      } else if (h === 24 && lastSp != null) {
+        addSeg(bar, start, 23, lastSp);
+      }
+    }
+
+    wrap.appendChild(row);
+  });
+}
+
+function normalizeThermostatSchedule(rawSchedule) {
+  const schedule = Array.isArray(rawSchedule) ? rawSchedule : [];
+  const filled = [];
+  for (let d = 0; d < 7; d++) {
+    const day = Array.isArray(schedule[d]) ? schedule[d] : [];
+    const row = [];
+    for (let h = 0; h < 24; h++) {
+      const value = Number(day[h]);
+      row.push(Number.isFinite(value) ? value : null);
+    }
+    filled.push(row);
+  }
+  return filled;
+}
+
+async function applyScheduleBlock(dayIdx, start, end, setpoint) {
+  if (!requireThermostatAuth("update schedule")) return;
+  const schedule = normalizeThermostatSchedule(state.thermostat?.config?.schedule);
+  let h = start;
+  while (true) {
+    schedule[dayIdx][h] = Number(setpoint.toFixed(1));
+    if (h === end) break;
+    h = (h + 1) % 24;
+    if (h === start) break;
+  }
+  await updateThermostatConfig({ schedule });
+  renderThermostatSchedule(schedule);
+}
+
+async function clearThermostatSchedule() {
+  if (!requireThermostatAuth("clear schedule")) return;
+  const schedule = normalizeThermostatSchedule([]);
+  await updateThermostatConfig({ schedule });
+  renderThermostatSchedule(schedule);
+}
+
+async function loadThermostatHistory(range) {
+  const canvas = document.getElementById("thermo-chart");
+  if (!canvas) return;
+  const now = Date.now();
+  let cutoff = 0;
+  if (range === "day") cutoff = now - 24 * 60 * 60 * 1000;
+  if (range === "week") cutoff = now - 7 * 24 * 60 * 60 * 1000;
+  if (range === "month") cutoff = now - 30 * 24 * 60 * 60 * 1000;
+
+  const startDate = cutoff ? new Date(cutoff) : new Date(0);
+  const endDate = new Date();
+
+  try {
+    const q = query(
+      collection(db, "thermostats", state.thermostatId, "history"),
+      orderBy("ts"),
+      startAt(startDate),
+      endAt(endDate),
+      limit(THERMOSTAT_HISTORY_LIMIT)
+    );
+    const snap = await getDocs(q);
+    const points = [];
+    snap.forEach((docSnap) => {
+      const d = docSnap.data();
+      const ts = toDate(d.ts);
+      if (!ts) return;
+      points.push({
+        ts,
+        tempF: d.tempF != null ? Number(d.tempF) : null,
+        setpointF: d.setpointF != null ? Number(d.setpointF) : null
+      });
+    });
+    state.thermostatHistory = points;
+    drawThermostatHistory(points, range);
+  } catch (err) {
+    console.error("Thermostat history load error", err);
+    drawThermostatHistory([], range);
+  }
+}
+
+function drawThermostatHistory(points, range) {
+  const canvas = document.getElementById("thermo-chart");
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  if (!points.length) {
+    ctx.fillStyle = "#94a3b8";
+    ctx.fillText("No history yet.", 20, 30);
+    return;
+  }
+
+  const temps = points.map((p) => p.tempF).filter((v) => v != null);
+  const sets = points.map((p) => p.setpointF).filter((v) => v != null);
+  const minVal = Math.min(...temps, ...sets);
+  const maxVal = Math.max(...temps, ...sets);
+  const minTs = points[0].ts.getTime();
+  const maxTs = points[points.length - 1].ts.getTime();
+  const pad = 30;
+  const h = canvas.height - 2 * pad;
+  const w = canvas.width - 2 * pad;
+
+  function y(v) {
+    if (maxVal === minVal) return canvas.height / 2;
+    return pad + h - ((v - minVal) / (maxVal - minVal)) * h;
+  }
+  function x(t) {
+    if (maxTs === minTs) return pad + w / 2;
+    return pad + ((t - minTs) / (maxTs - minTs)) * w;
+  }
+  function line(color, key) {
+    ctx.beginPath();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    let first = true;
+    points.forEach((p) => {
+      const v = p[key];
+      if (v == null) return;
+      const px = x(p.ts.getTime());
+      const py = y(v);
+      if (first) {
+        ctx.moveTo(px, py);
+        first = false;
+      } else {
+        ctx.lineTo(px, py);
+      }
+    });
+    ctx.stroke();
+  }
+
+  line("#2f74ff", "setpointF");
+  line("#30d158", "tempF");
+
+  ctx.strokeStyle = "#222a35";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(pad, canvas.height - pad);
+  ctx.lineTo(canvas.width - pad, canvas.height - pad);
+  ctx.stroke();
+
+  ctx.fillStyle = "#94a3b8";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  const ticks = 5;
+  for (let i = 0; i < ticks; i++) {
+    const t = minTs + (i / (ticks - 1)) * (maxTs - minTs);
+    const px = x(t);
+    const label = range === "day"
+      ? new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+      : new Date(t).toLocaleDateString();
+    ctx.fillText(label, px, canvas.height - pad + 4);
+    ctx.beginPath();
+    ctx.moveTo(px, canvas.height - pad);
+    ctx.lineTo(px, canvas.height - pad - 4);
+    ctx.strokeStyle = "#444d5e";
+    ctx.stroke();
   }
 }
 
@@ -990,6 +1454,13 @@ function modeClass(mode) {
   }
 }
 
+function thermostatModeClass(mode) {
+  const value = String(mode || "").toLowerCase();
+  if (value === "heat" || value === "cool" || value === "fan") return "online";
+  if (value === "off") return "stale";
+  return "offline";
+}
+
 function withConfigDefaults(config, last) {
   const home = config?.home ?? (last?.lat != null && last?.lon != null
     ? { lat: Number(last.lat), lon: Number(last.lon) }
@@ -1130,28 +1601,6 @@ function formatDayLabel(date) {
   return new Intl.DateTimeFormat("en", { month: "short", day: "numeric" }).format(target);
 }
 
-function normalizeThermostatUrl(raw) {
-  if (!raw) return "";
-  let url = String(raw).trim();
-  if (!url) return "";
-  if (!/^https?:\/\//i.test(url)) {
-    url = `http://${url}`;
-  }
-  return url.replace(/\/+$/, "");
-}
-
-function getThermostatUrl() {
-  return localStorage.getItem(THERMOSTAT_STORAGE_KEY) || "";
-}
-
-function setThermostatUrl(url) {
-  if (!url) {
-    localStorage.removeItem(THERMOSTAT_STORAGE_KEY);
-    return;
-  }
-  localStorage.setItem(THERMOSTAT_STORAGE_KEY, url);
-}
-
 function toggleAuthButtons(disabled) {
   signInBtn.disabled = disabled || !!state.user;
   signOutBtn.disabled = disabled || !state.user;
@@ -1170,9 +1619,13 @@ function cleanupListeners() {
     clearInterval(state.historyTimer);
     state.historyTimer = null;
   }
-  if (state.thermostatLoadTimeout) {
-    clearTimeout(state.thermostatLoadTimeout);
-    state.thermostatLoadTimeout = null;
+  if (state.thermostatHistoryTimer) {
+    clearInterval(state.thermostatHistoryTimer);
+    state.thermostatHistoryTimer = null;
+  }
+  if (state.thermostatUnsub) {
+    state.thermostatUnsub();
+    state.thermostatUnsub = null;
   }
   if (state.map) {
     state.map.remove();
@@ -1185,6 +1638,8 @@ function cleanupListeners() {
   state.timelineCursorMin = minutesSinceMidnight(new Date());
   state.currentConfig = null;
   state.lastSnapshot = null;
+  state.thermostat = null;
+  state.thermostatHistory = [];
   state.debug.deviceError = null;
   state.debug.devicesError = null;
   state.debug.historyError = null;
