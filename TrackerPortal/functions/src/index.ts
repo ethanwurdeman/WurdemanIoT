@@ -7,9 +7,9 @@ admin.initializeApp();
 const db = admin.firestore();
 const { Timestamp, FieldValue } = admin.firestore;
 
-const DEVICE_TOKEN_SECRET = defineSecret("DEVICE_TOKEN");
+const TYEE_TOKEN_SECRET = defineSecret("TYEE_TOKEN");
 const THERMOSTAT_TOKEN_SECRET = defineSecret("THERMOSTAT_TOKEN");
-const DEVICE_TOKEN = () => DEVICE_TOKEN_SECRET.value() || process.env.DEVICE_TOKEN || "";
+const TYEE_TOKEN = () => TYEE_TOKEN_SECRET.value() || process.env.TYEE_TOKEN || "";
 const THERMOSTAT_TOKEN = () => THERMOSTAT_TOKEN_SECRET.value() || process.env.THERMOSTAT_TOKEN || "";
 const DEFAULT_THERMOSTAT_CONFIG = {
   setpointF: 70,
@@ -80,12 +80,12 @@ interface Counters {
   monthPoints: number;
 }
 
-export const ingest = onRequest(
+export const tyee_ingest = onRequest(
   {
     cors: true,
     region: "us-central1",
     concurrency: 8,
-    secrets: [DEVICE_TOKEN_SECRET]
+    secrets: [TYEE_TOKEN_SECRET]
   },
   async (req, res) => {
     res.set("Access-Control-Allow-Origin", "*");
@@ -102,9 +102,9 @@ export const ingest = onRequest(
       return;
     }
 
-    const deviceToken = DEVICE_TOKEN();
+    const deviceToken = TYEE_TOKEN();
     if (!deviceToken) {
-      logger.error("DEVICE_TOKEN env var not set");
+      logger.error("TYEE_TOKEN env var not set");
       res.status(500).json({ error: "Server auth not configured" });
       return;
     }
@@ -171,11 +171,11 @@ export const ingest = onRequest(
   }
 );
 
-export const config = onRequest(
+export const tyee_config = onRequest(
   {
     cors: true,
     region: "us-central1",
-    secrets: [DEVICE_TOKEN_SECRET]
+    secrets: [TYEE_TOKEN_SECRET]
   },
   async (req, res) => {
     res.set("Access-Control-Allow-Origin", "*");
@@ -192,9 +192,9 @@ export const config = onRequest(
       return;
     }
 
-    const deviceToken = DEVICE_TOKEN();
+    const deviceToken = TYEE_TOKEN();
     if (!deviceToken) {
-      logger.error("DEVICE_TOKEN env var not set");
+      logger.error("TYEE_TOKEN env var not set");
       res.status(500).json({ error: "Server auth not configured" });
       return;
     }
@@ -252,6 +252,8 @@ interface ThermostatIngestRequest {
   rssi?: number | string;
   ip?: string;
   uptimeSec?: number | string;
+  heatCycleSec?: number | string;
+  burnSec?: number | string;
   sensorOk?: boolean | string | number;
   sdOk?: boolean | string | number;
   sdError?: string;
@@ -288,6 +290,8 @@ interface ThermostatStatus {
   scheduleActive: boolean;
   scheduleSetpoint: number | null;
   overrideActive: boolean;
+  heatCycleSec: number | null;
+  burnSec: number | null;
 }
 
 interface ThermostatHistoryPoint {
@@ -683,6 +687,8 @@ function normalizeThermostatStatus(body: ThermostatIngestRequest): ThermostatSta
       ip: body.ip ? String(body.ip) : null
     },
     uptimeSec: toNumber(body.uptimeSec, 0),
+    heatCycleSec: toNullableNumber(body.heatCycleSec),
+    burnSec: toNullableNumber(body.burnSec),
     sensorOk: toBoolean(body.sensorOk, false),
     sdOk: toBoolean(body.sdOk, false),
     sdError: body.sdError ? String(body.sdError) : null,

@@ -11,7 +11,7 @@ export const firebaseConfig = {
 
 // Device ingest settings (keep this token private).
 export const ingestConfig = {
-  url: "https://us-central1-wurdemaniot.cloudfunctions.net/ingest",
+  url: "https://us-central1-wurdemaniot.cloudfunctions.net/tyee_ingest",
   deviceId: "Tyee",
   deviceToken: "b7c9e2a41fd64e7d9f13c8a5",
   thermostatId: "home"

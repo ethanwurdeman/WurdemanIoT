@@ -23,11 +23,11 @@ Single-page Firebase Hosting app for the WurdemanIoT control center plus Cloud F
 - `devices/{deviceId}/points/{autoId}`: `{ lat, lon, ts, battery, sats, hdop, speedMph, headingDeg, mode, createdAt }`
 
 ## Functions (v2, us-central1)
-- Auth header required: `X-Device-Token: <DEVICE_TOKEN>`.
-- Ingest endpoint: `https://us-central1-wurdemaniot.cloudfunctions.net/ingest`
+- Auth header required: `X-Device-Token: <TYEE_TOKEN>`.
+- Ingest endpoint: `https://us-central1-wurdemaniot.cloudfunctions.net/tyee_ingest`
 - Device token (Tyee): `b7c9e2a41fd64e7d9f13c8a5`
-- POST `/ingest`: accepts single point or `{ points: [] }` batch, applies defaults, updates `last`, appends to `points`, and maintains `counters`.
-- GET `/config?deviceId=...`: returns config with defaults applied plus counters/last snapshot.
+- POST `/tyee_ingest`: accepts single point or `{ points: [] }` batch, applies defaults, updates `last`, appends to `points`, and maintains `counters`.
+- GET `/tyee_config?deviceId=...`: returns config with defaults applied plus counters/last snapshot.
 - Thermostat endpoints: `https://us-central1-wurdemaniot.cloudfunctions.net/thermostatIngest` and `/thermostatConfig`.
 - POST `/thermostatIngest`: accepts current status and optional history point(s), updates `thermostats/{deviceId}`.
 - GET `/thermostatConfig?deviceId=...`: returns thermostat config; POST updates config (device-authenticated).
@@ -40,9 +40,9 @@ Single-page Firebase Hosting app for the WurdemanIoT control center plus Cloud F
    npm install
    npm run build
    ```
-3) Set the ingest auth secret (used in process.env.DEVICE_TOKEN):
+3) Set the ingest auth secret (used in process.env.TYEE_TOKEN):
    ```
-   firebase functions:secrets:set DEVICE_TOKEN
+   firebase functions:secrets:set TYEE_TOKEN
    ```
 4) Deploy:
    ```

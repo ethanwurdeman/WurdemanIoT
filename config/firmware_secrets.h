@@ -25,8 +25,12 @@
 
 // --- Tyee tracker (T-SIM7080G-S3) ---
 #define DEVICE_ID "Tyee"
-#define DEVICE_TOKEN "b7c9e2a41fd64e7d9f13c8a5"  // tracker ingest token
-#define INGEST_BASE_URL "https://ingest-dwoseol4ba-uc.a.run.app"
+#define TYEE_DEVICE_TOKEN "b7c9e2a41fd64e7d9f13c8a5"  // tracker ingest token (server secret TYEE_TOKEN)
+#define TYEE_INGEST_URL "https://us-central1-wurdemaniot.cloudfunctions.net/tyee_ingest"
+#define TYEE_CONFIG_URL "https://us-central1-wurdemaniot.cloudfunctions.net/tyee_config"
+// Backward-compat aliases for older firmware references
+#define DEVICE_TOKEN TYEE_DEVICE_TOKEN
+#define INGEST_BASE_URL TYEE_INGEST_URL
 #define CELL_APN "hologram"
 #define CELL_APN_USER ""
 #define CELL_APN_PASS ""

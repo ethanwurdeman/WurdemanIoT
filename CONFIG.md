@@ -13,13 +13,13 @@ Single place to see/change secrets, defaults, and paths. Keep this file updated 
 - Firestore rules file: TrackerPortal/firestore.rules
 
 ## Cloud Functions auth
-- DEVICE_TOKEN (ingest) env: set via Functions secret
+- TYEE_TOKEN (ingest) env: set via Functions secret (matches TYEE_DEVICE_TOKEN)
 - THERMOSTAT_TOKEN env: set to match thermostat device token
 
 ## Web client config
 - File: TrackerPortal/public/firebase-config.js
   - firebaseConfig.* matches Firebase above
-  - ingestConfig.url: https://us-central1-wurdemaniot.cloudfunctions.net/ingest
+  - ingestConfig.url: https://us-central1-wurdemaniot.cloudfunctions.net/tyee_ingest
   - ingestConfig.deviceId: Tyee
   - ingestConfig.deviceToken: b7c9e2a41fd64e7d9f13c8a5
   - ingestConfig.thermostatId: home
@@ -40,9 +40,10 @@ Single place to see/change secrets, defaults, and paths. Keep this file updated 
 - Archived old .ino: device/thermostat/archived_thermostat_webui.ino
 
 ## Tyee tracker (cellular/Wi-Fi) - folder device/tyee
-- Ingest base URL: https://ingest-dwoseol4ba-uc.a.run.app
+- Ingest URL: https://us-central1-wurdemaniot.cloudfunctions.net/tyee_ingest
+- Config URL: https://us-central1-wurdemaniot.cloudfunctions.net/tyee_config
 - Device ID: Tyee
-- Device token: set in config/firmware_secrets.h
+- Device token: TYEE_DEVICE_TOKEN set in config/firmware_secrets.h (matches TYEE_TOKEN secret)
 - WiFi SSID/PASS: set in config/firmware_secrets.h
 - APN: hologram, user/pass blank
 - Firmware source: (not present in repo; only build artifacts in .pio). Re-add source when available.
@@ -65,5 +66,5 @@ Single place to see/change secrets, defaults, and paths. Keep this file updated 
 
 ## Notes
 - Keep this file updated when tokens/keys/SSIDs change.
-- Functions env vars must match device tokens (DEVICE_TOKEN for trackers, THERMOSTAT_TOKEN for thermostat).
+- Functions env vars must match device tokens (TYEE_TOKEN for Tyee tracker, THERMOSTAT_TOKEN for thermostat).
 - Shared firmware secrets live in config/firmware_secrets.h.

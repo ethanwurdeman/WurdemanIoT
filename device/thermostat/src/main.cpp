@@ -116,7 +116,7 @@ unsigned long lastSdWriteMs = 0;
 bool lastSdWriteOk = true;
 const char* lastSdError = "none";
 unsigned long sdWriteFailures = 0;
-const unsigned long CLOUD_PUSH_INTERVAL_MS = 60000;
+const unsigned long CLOUD_PUSH_INTERVAL_MS = 300000;
 const unsigned long CONFIG_FETCH_INTERVAL_MS = 120000;
 const unsigned long CONFIG_PUSH_INTERVAL_MS = 15000;
 unsigned long lastCloudPush = 0;
@@ -162,6 +162,7 @@ unsigned long fanRunUntil = 0;
 float lastTempF = NAN;
 float lastHumidity = NAN;
 float lastHeatIndexF = NAN;
+float lastCtlTemp = NAN;
 unsigned long lastRead = 0;
 const unsigned long READ_INTERVAL_MS = 2000;
 unsigned long lastDisplay = 0;
@@ -170,6 +171,16 @@ float scheduleSP[7][24]; // NaN means no schedule entry
 int lastScheduleHour = -1;
 bool overrideUntilNextSchedule = false;
 int overrideStartHour = -1;
+const unsigned long BURN_DELAY_MS = 90000; // heater gas starts after 90s
+unsigned long heatCycleStartMs = 0;
+float lastHeatCycleSec = 0;
+float lastBurnSec = 0;
+float lastPushedCtlTemp = NAN;
+float lastPushedSetpoint = NAN;
+bool lastPushedHeat = false;
+bool lastPushedCool = false;
+bool lastPushedFan = false;
+bool forceCloudPush = false;
 // History logging (setpoint vs control temperature, 1-min samples, up to 7 days)
 const unsigned long HISTORY_INTERVAL_MS = 60000;
 const int HIST_MAX = 10080; // 7 days at 1-minute resolution
@@ -225,6 +236,7 @@ bool fetchThermostatConfig();
 bool pushThermostatConfig();
 void markConfigDirty();
 void applyRemoteConfig(JsonObject config);
+void requestCloudPush();
 
 void setup() {
   Serial.begin(115200);
@@ -315,6 +327,7 @@ void loop() {
   unsigned long now = millis();
   if (now - lastRead >= READ_INTERVAL_MS) {
     lastRead = now;
+    float prevSetpoint = setpointF;
     float t = dht.readTemperature(true); // true = Fahrenheit
     float h = dht.readHumidity();
     if (DEBUG_SERIAL && (isnan(t) || isnan(h))) {
@@ -346,18 +359,24 @@ void loop() {
             setpointF = sp;
             lastScheduleHour = h;
             overrideUntilNextSchedule = false;
+            requestCloudPush();
           }
         } else {
           if (!isnan(sp) && (lastScheduleHour != h)) {
             setpointF = sp;
             lastScheduleHour = h;
+            requestCloudPush();
           }
         }
       }
     }
+    if (fabs(setpointF - prevSetpoint) > 0.01f) {
+      requestCloudPush();
+    }
 
     // Control temperature: prefer real-feel, fall back to actual
     float ctlTemp = !isnan(lastHeatIndexF) ? lastHeatIndexF : lastTempF;
+    lastCtlTemp = ctlTemp;
 
     // Hysteresis thresholds (half the diff)
     float onThresholdHeat  = setpointF - (diffF * 0.5f);
@@ -365,17 +384,39 @@ void loop() {
     float onThresholdCool  = setpointF + (diffF * 0.5f);
     float offThresholdCool = setpointF - (diffF * 0.5f);
 
+    bool prevHeat = heatOn;
+    bool prevCool = coolOn;
     // Heat control
     if (mode == "heat" && !isnan(ctlTemp)) {
       if (!heatOn && ctlTemp <= onThresholdHeat && (now - lastHeatToggle) >= MIN_OFF_TIME_MS) {
         heatOn = true;
         lastHeatToggle = now;
+        heatCycleStartMs = now;
+        requestCloudPush();
       } else if (heatOn && ctlTemp >= offThresholdHeat && (now - lastHeatToggle) >= MIN_ON_TIME_MS) {
         heatOn = false;
         lastHeatToggle = now;
+        if (heatCycleStartMs > 0) {
+          unsigned long cycleMs = now - heatCycleStartMs;
+          lastHeatCycleSec = (float)cycleMs / 1000.0f;
+          lastBurnSec = (cycleMs > BURN_DELAY_MS) ? (float)(cycleMs - BURN_DELAY_MS) / 1000.0f : 0.0f;
+          heatCycleStartMs = 0;
+        }
+        requestCloudPush();
       }
     } else {
-      heatOn = false;
+      if (heatOn) {
+        heatOn = false;
+        if (heatCycleStartMs > 0) {
+          unsigned long cycleMs = now - heatCycleStartMs;
+          lastHeatCycleSec = (float)cycleMs / 1000.0f;
+          lastBurnSec = (cycleMs > BURN_DELAY_MS) ? (float)(cycleMs - BURN_DELAY_MS) / 1000.0f : 0.0f;
+          heatCycleStartMs = 0;
+        }
+        requestCloudPush();
+      } else {
+        heatCycleStartMs = 0;
+      }
     }
 
     // Cool control
@@ -383,12 +424,17 @@ void loop() {
       if (!coolOn && ctlTemp >= onThresholdCool && (now - lastCoolToggle) >= MIN_OFF_TIME_MS) {
         coolOn = true;
         lastCoolToggle = now;
+        requestCloudPush();
       } else if (coolOn && ctlTemp <= offThresholdCool && (now - lastCoolToggle) >= MIN_ON_TIME_MS) {
         coolOn = false;
         lastCoolToggle = now;
+        requestCloudPush();
       }
     } else {
-      coolOn = false;
+      if (coolOn) {
+        coolOn = false;
+        requestCloudPush();
+      }
     }
 
     // Fan timer (manual fan mode)
@@ -1267,10 +1313,22 @@ void markConfigDirty() {
   configDirty = true;
 }
 
+void requestCloudPush() {
+  forceCloudPush = true;
+}
+
 void tickCloudSync() {
   if (!wifiConnected) return;
   if (THERMOSTAT_DEVICE_TOKEN_STR[0] == '\0') return;
   unsigned long now = millis();
+
+  float ctlTemp = lastCtlTemp;
+  bool tempDelta = !isnan(ctlTemp) && (isnan(lastPushedCtlTemp) || fabs(ctlTemp - lastPushedCtlTemp) >= 1.0f);
+  bool setpointDelta = isnan(lastPushedSetpoint) || fabs(setpointF - lastPushedSetpoint) >= 0.01f;
+  bool outputDelta = (heatOn != lastPushedHeat) || (coolOn != lastPushedCool) || (fanOn != lastPushedFan);
+  if (tempDelta || setpointDelta || outputDelta) {
+    forceCloudPush = true;
+  }
 
   if (configDirty && ((lastConfigPush == 0) || (now - lastConfigPush >= CONFIG_PUSH_INTERVAL_MS))) {
     if (pushThermostatConfig()) {
@@ -1285,10 +1343,16 @@ void tickCloudSync() {
     }
   }
 
-  if ((lastCloudPush == 0) || (now - lastCloudPush >= CLOUD_PUSH_INTERVAL_MS)) {
+  if (forceCloudPush || (lastCloudPush == 0) || (now - lastCloudPush >= CLOUD_PUSH_INTERVAL_MS)) {
     bool includeHistory = historyDirty;
     if (pushThermostatStatus(includeHistory)) {
       lastCloudPush = now;
+      forceCloudPush = false;
+      lastPushedCtlTemp = ctlTemp;
+      lastPushedSetpoint = setpointF;
+      lastPushedHeat = heatOn;
+      lastPushedCool = coolOn;
+      lastPushedFan = fanOn;
       if (includeHistory) historyDirty = false;
     }
   }
@@ -1343,6 +1407,8 @@ bool pushThermostatStatus(bool includeHistory) {
   doc["scheduleActive"] = scheduled;
   if (!isnan(scheduledSp)) doc["scheduleSetpoint"] = scheduledSp;
   doc["overrideActive"] = overrideUntilNextSchedule;
+  if (lastHeatCycleSec > 0.0f) doc["heatCycleSec"] = lastHeatCycleSec;
+  if (lastBurnSec > 0.0f) doc["burnSec"] = lastBurnSec;
 
   if (includeHistory && lastHistTs > 0) {
     JsonArray history = doc.createNestedArray("history");
@@ -1499,6 +1565,7 @@ void applyRemoteConfig(JsonObject config) {
     } else {
       overrideStartHour = -1;
     }
+    requestCloudPush();
   }
 }
 

@@ -14,6 +14,7 @@ import {
   limit,
   onSnapshot,
   orderBy,
+  addDoc,
   query,
   setDoc,
   startAt,
@@ -57,10 +58,13 @@ const state = {
   currentConfig: null,
   lastSnapshot: null,
   thermostatUnsub: null,
+  propaneUnsub: null,
   thermostatHistoryTimer: null,
   thermostatId: DEFAULT_THERMOSTAT_ID,
   thermostat: null,
   thermostatHistory: [],
+  propaneReadings: [],
+  propaneStats: null,
   thermostatRange: "day",
   debug: {
     deviceError: null,
@@ -231,10 +235,11 @@ function renderThermostat() {
     <div class="thermo-grid">
       <div class="card thermo-panel">
         <div class="thermo-metric">
-          <div class="thermo-label">Temperature</div>
-          <div class="thermo-value" id="thermo-temp">--</div>
-          <div class="thermo-sub">Real feel: <span id="thermo-feel">--</span></div>
+          <div class="thermo-label">Real feel</div>
+          <div class="thermo-value" id="thermo-feel">--</div>
+          <div class="thermo-sub">Temperature: <span id="thermo-temp">--</span></div>
           <div class="thermo-sub">Humidity: <span id="thermo-hum">--</span></div>
+          <div class="thermo-sub">Setpoint: <span id="thermo-setpoint-live">--</span></div>
         </div>
         <div class="thermo-meta" id="thermo-meta">Last update: --</div>
         <div class="thermo-chip-row">
@@ -298,6 +303,35 @@ function renderThermostat() {
 
     <div class="card thermo-panel">
       <div class="section-header">
+        <h3>Propane</h3>
+        <div class="thermo-schedule-actions">
+          <button class="btn ghost" type="button" id="propane-refresh">Refresh</button>
+        </div>
+      </div>
+      <div class="thermo-schedule-legend">
+        Track tank level and estimated runout. Log readings when you check the gauge.
+      </div>
+      <div class="propane-grid">
+        <div class="propane-level">
+          <div class="thermo-label">Current level</div>
+          <div class="thermo-value" id="propane-percent">--</div>
+          <div class="thermo-sub" id="propane-gallons">--</div>
+          <div class="thermo-sub" id="propane-eta">--</div>
+        </div>
+        <div class="propane-form">
+          <label>Gallons</label>
+          <input type="number" min="0" step="0.1" id="propane-gallons-input" placeholder="e.g. 362" />
+          <label>Capacity (gal)</label>
+          <input type="number" min="1" step="1" id="propane-capacity-input" placeholder="e.g. 400" />
+          <button class="btn" type="button" id="propane-save">Log reading</button>
+        </div>
+      </div>
+      <div class="propane-stats" id="propane-stats">No readings yet.</div>
+      <canvas id="propane-chart" width="900" height="200"></canvas>
+    </div>
+
+    <div class="card thermo-panel">
+      <div class="section-header">
         <h3>History</h3>
         <div class="thermo-history-actions">
           <button class="btn ghost" type="button" data-range="day">Day</button>
@@ -316,6 +350,7 @@ function renderThermostat() {
 
   bindThermostatControls();
   subscribeThermostat();
+  subscribePropane();
   loadThermostatHistory(state.thermostatRange);
   state.thermostatHistoryTimer = setInterval(() => {
     loadThermostatHistory(state.thermostatRange);
@@ -334,6 +369,8 @@ function bindThermostatControls() {
   const scheduleClear = document.getElementById("thermo-schedule-clear");
   const historyRefresh = document.getElementById("thermo-history-refresh");
   const historyButtons = document.querySelectorAll(".thermo-history-actions button[data-range]");
+  const propaneSave = document.getElementById("propane-save");
+  const propaneRefresh = document.getElementById("propane-refresh");
 
   const canEdit = !!state.user;
   const disableEls = [
@@ -404,6 +441,13 @@ function bindThermostatControls() {
       loadThermostatHistory(range);
     });
   });
+
+  if (propaneSave) {
+    propaneSave.onclick = () => savePropaneReading();
+  }
+  if (propaneRefresh) {
+    propaneRefresh.onclick = () => loadPropaneReadings(true);
+  }
 }
 
 function requireThermostatAuth(actionLabel) {
@@ -421,7 +465,11 @@ async function updateThermostatConfig(partial) {
 
 function adjustThermostatConfig(field, delta, min, max) {
   if (!requireThermostatAuth("update thermostat config")) return;
-  const current = Number(state.thermostat?.config?.[field] ?? 0);
+  const current = Number(
+    state.thermostat?.config?.[field] ??
+      state.thermostat?.status?.[field] ??
+      0
+  );
   const next = Math.min(Math.max(current + delta, min), max);
   updateThermostatConfig({ [field]: Number(next.toFixed(1)) });
 }
@@ -458,6 +506,7 @@ function updateThermostatUI(data) {
   const wifiEl = document.getElementById("thermo-wifi");
   const sdEl = document.getElementById("thermo-sd");
   const setpointEl = document.getElementById("thermo-setpoint");
+  const setpointLiveEl = document.getElementById("thermo-setpoint-live");
   const diffEl = document.getElementById("thermo-diff");
   const fanStatus = document.getElementById("thermo-fan-status");
 
@@ -536,6 +585,10 @@ function updateThermostatUI(data) {
   if (setpointEl) {
     const sp = config.setpointF ?? status.setpointF;
     setpointEl.textContent = sp != null ? Number(sp).toFixed(1) : "--";
+  }
+  if (setpointLiveEl) {
+    const sp = status.setpointF ?? config.setpointF;
+    setpointLiveEl.textContent = sp != null ? `${Number(sp).toFixed(1)} F` : "--";
   }
   if (diffEl) {
     const diff = config.diffF ?? status.diffF;
@@ -796,6 +849,195 @@ function drawThermostatHistory(points, range) {
     ctx.strokeStyle = "#444d5e";
     ctx.stroke();
   }
+}
+
+function subscribePropane() {
+  if (state.propaneUnsub) {
+    state.propaneUnsub();
+    state.propaneUnsub = null;
+  }
+  const ref = collection(db, "thermostats", state.thermostatId, "propane");
+  const q = query(ref, orderBy("ts", "desc"), limit(100));
+  state.propaneUnsub = onSnapshot(
+    q,
+    (snap) => {
+      const readings = [];
+      snap.forEach((docSnap) => {
+        const d = docSnap.data();
+        const ts = toDate(d.ts);
+        if (!ts) return;
+        readings.push({
+          id: docSnap.id,
+          ts,
+          level: Number(d.levelGallons ?? d.level ?? d.gallons ?? 0),
+          capacity: Number(d.capacityGallons ?? d.capacity ?? d.cap ?? 400)
+        });
+      });
+      state.propaneReadings = readings;
+      renderPropane(readings);
+    },
+    (err) => {
+      console.error("Propane listener error", err);
+    }
+  );
+}
+
+async function loadPropaneReadings(force = false) {
+  if (!force && state.propaneReadings.length) return;
+  const ref = collection(db, "thermostats", state.thermostatId, "propane");
+  const q = query(ref, orderBy("ts", "desc"), limit(100));
+  const snap = await getDocs(q);
+  const readings = [];
+  snap.forEach((docSnap) => {
+    const d = docSnap.data();
+    const ts = toDate(d.ts);
+    if (!ts) return;
+    readings.push({
+      id: docSnap.id,
+      ts,
+      level: Number(d.levelGallons ?? d.level ?? d.gallons ?? 0),
+      capacity: Number(d.capacityGallons ?? d.capacity ?? d.cap ?? 400)
+    });
+  });
+  state.propaneReadings = readings;
+  renderPropane(readings);
+}
+
+async function savePropaneReading() {
+  if (!requireThermostatAuth("log propane")) return;
+  const levelInput = document.getElementById("propane-gallons-input");
+  const capInput = document.getElementById("propane-capacity-input");
+  const level = Number(levelInput?.value);
+  const capacity = Number(capInput?.value) || 400;
+  if (!Number.isFinite(level) || level <= 0) {
+    alert("Enter a valid gallons value.");
+    return;
+  }
+  if (!Number.isFinite(capacity) || capacity <= 0) {
+    alert("Enter a valid capacity.");
+    return;
+  }
+  const ref = collection(db, "thermostats", state.thermostatId, "propane");
+  await addDoc(ref, {
+    levelGallons: level,
+    capacityGallons: capacity,
+    ts: Timestamp.now()
+  });
+  if (levelInput) levelInput.value = "";
+}
+
+function renderPropane(readings) {
+  const pctEl = document.getElementById("propane-percent");
+  const galEl = document.getElementById("propane-gallons");
+  const etaEl = document.getElementById("propane-eta");
+  const statsEl = document.getElementById("propane-stats");
+  const capInput = document.getElementById("propane-capacity-input");
+
+  if (!readings.length) {
+    if (pctEl) pctEl.textContent = "--";
+    if (galEl) galEl.textContent = "--";
+    if (etaEl) etaEl.textContent = "--";
+    if (statsEl) statsEl.textContent = "No readings yet.";
+    drawPropaneChart([]);
+    return;
+  }
+
+  const latest = readings[0];
+  const level = Math.max(0, latest.level);
+  const capacity = Math.max(1, latest.capacity || 400);
+  const percent = Math.min(100, Math.max(0, (level / capacity) * 100));
+  if (pctEl) {
+    pctEl.textContent = `${percent.toFixed(1)}%`;
+    pctEl.style.color = propaneColor(percent);
+  }
+  if (galEl) galEl.textContent = `${level.toFixed(1)} gal / ${capacity} gal`;
+
+  if (capInput && !capInput.value) capInput.value = capacity;
+
+  const stats = computePropaneStats(readings);
+  state.propaneStats = stats;
+  const status = state.thermostat?.status || {};
+  const cycleLabel = status.heatCycleSec
+    ? `Last heat run: ${(Number(status.heatCycleSec) / 60).toFixed(1)} min`
+    : "";
+  const burnLabel = status.burnSec
+    ? ` (~${(Number(status.burnSec) / 60).toFixed(1)} min burn)`
+    : "";
+  if (etaEl) {
+    etaEl.textContent = stats.etaDays != null
+      ? `Est. ${Math.max(0, stats.etaDays).toFixed(1)} days to 20%`
+      : "Est. time to 20%: --";
+    etaEl.style.color = propaneColor(percent);
+  }
+  if (statsEl) {
+    statsEl.textContent = stats.usagePerDay != null
+      ? `Usage (avg): ${stats.usagePerDay.toFixed(2)} gal/day, ${stats.usagePerWeek.toFixed(1)} gal/wk, ${stats.usagePerMonth.toFixed(1)} gal/mo${cycleLabel ? " | " + cycleLabel + burnLabel : ""}`
+      : `Need at least two readings to compute usage.${cycleLabel ? " " + cycleLabel + burnLabel : ""}`;
+  }
+
+  drawPropaneChart(readings);
+}
+
+function computePropaneStats(readings) {
+  if (!readings?.length) return { usagePerDay: null, usagePerWeek: null, usagePerMonth: null, etaDays: null };
+  const sorted = [...readings].sort((a, b) => a.ts.getTime() - b.ts.getTime());
+  if (sorted.length < 2) return { usagePerDay: null, usagePerWeek: null, usagePerMonth: null, etaDays: null };
+  const first = sorted[0];
+  const last = sorted[sorted.length - 1];
+  const days = Math.max((last.ts.getTime() - first.ts.getTime()) / (1000 * 60 * 60 * 24), 0.01);
+  const used = (first.level - last.level);
+  const usagePerDay = used > 0 ? used / days : 0;
+  const usagePerWeek = usagePerDay * 7;
+  const usagePerMonth = usagePerDay * 30;
+  const capacity = last.capacity || 400;
+  const targetLevel = capacity * 0.2;
+  const etaDays = usagePerDay > 0 ? (Math.max(0, last.level - targetLevel) / usagePerDay) : null;
+  return { usagePerDay, usagePerWeek, usagePerMonth, etaDays };
+}
+
+function propaneColor(percent) {
+  if (percent >= 50) return "#30d158";
+  if (percent >= 20) return "#fbbf24";
+  if (percent >= 10) return "#f97316";
+  return "#ef4444";
+}
+
+function drawPropaneChart(readings) {
+  const canvas = document.getElementById("propane-chart");
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (!readings.length) {
+    ctx.fillStyle = "#94a3b8";
+    ctx.fillText("No propane readings yet.", 20, 30);
+    return;
+  }
+  const sorted = [...readings].sort((a, b) => a.ts.getTime() - b.ts.getTime());
+  const percents = sorted.map((r) => Math.min(100, Math.max(0, (r.level / (r.capacity || 400)) * 100)));
+  const minP = Math.min(...percents);
+  const maxP = Math.max(...percents);
+  const minTs = sorted[0].ts.getTime();
+  const maxTs = sorted[sorted.length - 1].ts.getTime();
+  const pad = 30;
+  const h = canvas.height - 2 * pad;
+  const w = canvas.width - 2 * pad;
+  const y = (v) => pad + h - ((v - minP) / Math.max(1, (maxP - minP))) * h;
+  const x = (t) => pad + ((t - minTs) / Math.max(1, (maxTs - minTs))) * w;
+
+  ctx.beginPath();
+  ctx.strokeStyle = "#38bdf8";
+  ctx.lineWidth = 2;
+  sorted.forEach((r, idx) => {
+    const px = x(r.ts.getTime());
+    const py = y(percents[idx]);
+    if (idx === 0) ctx.moveTo(px, py);
+    else ctx.lineTo(px, py);
+  });
+  ctx.stroke();
+
+  ctx.fillStyle = "#94a3b8";
+  ctx.textAlign = "left";
+  ctx.fillText("Percent full over time", pad, 16);
 }
 
 function renderHome() {
@@ -1656,6 +1898,10 @@ function cleanupListeners() {
     state.thermostatUnsub();
     state.thermostatUnsub = null;
   }
+  if (state.propaneUnsub) {
+    state.propaneUnsub();
+    state.propaneUnsub = null;
+  }
   if (state.map) {
     state.map.remove();
     state.map = null;
@@ -1669,6 +1915,8 @@ function cleanupListeners() {
   state.lastSnapshot = null;
   state.thermostat = null;
   state.thermostatHistory = [];
+  state.propaneReadings = [];
+  state.propaneStats = null;
   state.debug.deviceError = null;
   state.debug.devicesError = null;
   state.debug.historyError = null;
