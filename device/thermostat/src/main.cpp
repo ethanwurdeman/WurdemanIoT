@@ -14,28 +14,49 @@
 #include <SPI.h>
 #include <SD.h>
 
-#if __has_include("secrets.h")
-#include "secrets.h"
-#endif
+#include <firmware_secrets.h>
 
-// === User config ===
 #ifndef WIFI_SSID
-#define WIFI_SSID "Wurdeman Starlink 2.4"
+#error "WIFI_SSID must be defined in config/firmware_secrets.h"
 #endif
 #ifndef WIFI_PASSWORD
-#define WIFI_PASSWORD "Koda2020"
+#error "WIFI_PASSWORD must be defined in config/firmware_secrets.h"
 #endif
 #ifndef THERMOSTAT_DEVICE_ID
-#define THERMOSTAT_DEVICE_ID "home"
+#error "THERMOSTAT_DEVICE_ID must be defined in config/firmware_secrets.h"
 #endif
 #ifndef THERMOSTAT_DEVICE_TOKEN
-#define THERMOSTAT_DEVICE_TOKEN "REPLACE_ME"
+#error "THERMOSTAT_DEVICE_TOKEN must be defined in config/firmware_secrets.h"
 #endif
 #ifndef THERMOSTAT_INGEST_URL
-#define THERMOSTAT_INGEST_URL "https://us-central1-wurdemaniot.cloudfunctions.net/thermostatIngest"
+#error "THERMOSTAT_INGEST_URL must be defined in config/firmware_secrets.h"
 #endif
 #ifndef THERMOSTAT_CONFIG_URL
-#define THERMOSTAT_CONFIG_URL "https://us-central1-wurdemaniot.cloudfunctions.net/thermostatConfig"
+#error "THERMOSTAT_CONFIG_URL must be defined in config/firmware_secrets.h"
+#endif
+#ifndef AUTHORIZED_SSID
+#error "AUTHORIZED_SSID must be defined in config/firmware_secrets.h"
+#endif
+#ifndef ADMIN_USER
+#error "ADMIN_USER must be defined in config/firmware_secrets.h"
+#endif
+#ifndef ADMIN_PASSWORD
+#error "ADMIN_PASSWORD must be defined in config/firmware_secrets.h"
+#endif
+#ifndef AP_SSID
+#error "AP_SSID must be defined in config/firmware_secrets.h"
+#endif
+#ifndef AP_PASSWORD
+#error "AP_PASSWORD must be defined in config/firmware_secrets.h"
+#endif
+#ifndef THERMOSTAT_DEFAULT_SETPOINT_F
+#error "THERMOSTAT_DEFAULT_SETPOINT_F must be defined in config/firmware_secrets.h"
+#endif
+#ifndef THERMOSTAT_DEFAULT_DIFF_F
+#error "THERMOSTAT_DEFAULT_DIFF_F must be defined in config/firmware_secrets.h"
+#endif
+#ifndef THERMOSTAT_DEFAULT_MODE
+#error "THERMOSTAT_DEFAULT_MODE must be defined in config/firmware_secrets.h"
 #endif
 
 const char *DEFAULT_WIFI_SSID = WIFI_SSID;
@@ -44,11 +65,11 @@ const char *THERMOSTAT_DEVICE_ID_STR = THERMOSTAT_DEVICE_ID;
 const char *THERMOSTAT_DEVICE_TOKEN_STR = THERMOSTAT_DEVICE_TOKEN;
 const char *THERMOSTAT_INGEST_ENDPOINT = THERMOSTAT_INGEST_URL;
 const char *THERMOSTAT_CONFIG_ENDPOINT = THERMOSTAT_CONFIG_URL;
-const char *AUTHORIZED_SSID = "WurdemanIoT"; // network required for control changes
-const char *ADMIN_USER = "admin";
-const char *ADMIN_PASSWORD = "change-me";
-const char *AP_SSID = "Thermostat-Setup";
-const char *AP_PASSWORD = "";
+const char *AUTHORIZED_SSID_STR = AUTHORIZED_SSID; // network required for control changes
+const char *ADMIN_USER_STR = ADMIN_USER;
+const char *ADMIN_PASSWORD_STR = ADMIN_PASSWORD;
+const char *AP_SSID_STR = AP_SSID;
+const char *AP_PASSWORD_STR = AP_PASSWORD;
 const char *HEADER_KEYS[] = {"Cookie"};
 const size_t HEADER_KEYS_COUNT = 1;
 
@@ -71,9 +92,9 @@ const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
 const unsigned long WIFI_RECONNECT_INTERVAL_MS = 30000;
 
 // Control defaults
-float setpointF = 70.0; // target temperature in Fahrenheit
-float diffF     = 1.0;  // hysteresis differential
-String mode     = "heat"; // heat, cool, fan, off
+float setpointF = THERMOSTAT_DEFAULT_SETPOINT_F; // target temperature in Fahrenheit
+float diffF     = THERMOSTAT_DEFAULT_DIFF_F;  // hysteresis differential
+String mode     = THERMOSTAT_DEFAULT_MODE; // heat, cool, fan, off
 uint8_t fanRequestMinutes = 0; // pending fan timer request (minutes)
 
 // Anti-short-cycle timings (ms)
@@ -510,8 +531,8 @@ bool isAuthenticated() {
 
 bool onAuthorizedNetwork() {
   if (WiFi.status() != WL_CONNECTED) return false;
-  if (AUTHORIZED_SSID[0] == '\0') return true;
-  return WiFi.SSID() == String(AUTHORIZED_SSID);
+  if (AUTHORIZED_SSID_STR[0] == '\0') return true;
+  return WiFi.SSID() == String(AUTHORIZED_SSID_STR);
 }
 
 bool canControl() {
@@ -568,14 +589,14 @@ void startWiFi() {
 
 void startAp() {
   WiFi.mode(WIFI_AP_STA);
-  if (AP_PASSWORD[0] != '\0') {
-    WiFi.softAP(AP_SSID, AP_PASSWORD);
+  if (AP_PASSWORD_STR[0] != '\0') {
+    WiFi.softAP(AP_SSID_STR, AP_PASSWORD_STR);
   } else {
-    WiFi.softAP(AP_SSID);
+    WiFi.softAP(AP_SSID_STR);
   }
   apMode = true;
   wifiIpStr = WiFi.softAPIP().toString();
-  Serial.printf("AP started: %s (IP %s)\n", AP_SSID, wifiIpStr.c_str());
+  Serial.printf("AP started: %s (IP %s)\n", AP_SSID_STR, wifiIpStr.c_str());
 }
 
 void updateWiFiStatus() {
@@ -618,7 +639,7 @@ void handleLogin() {
   if (server.method() == HTTP_POST) {
     String user = server.arg("user");
     String pass = server.arg("pass");
-    if (user == ADMIN_USER && pass == ADMIN_PASSWORD) {
+    if (user == ADMIN_USER_STR && pass == ADMIN_PASSWORD_STR) {
       sessionToken = makeToken();
       sessionStartMs = millis();
       String cookie = "session=" + sessionToken + "; Path=/; HttpOnly; SameSite=Strict; Max-Age=" + String(SESSION_TTL_MS / 1000);
@@ -669,7 +690,7 @@ void handleWifiPage() {
   bool connected = (WiFi.status() == WL_CONNECTED);
   bool allowEdit = !connected || canControl();
   String modeLabel = connected ? "Connected" : (apMode ? "AP mode" : "Offline");
-  String ssidLabel = connected ? WiFi.SSID() : (apMode ? String(AP_SSID) : String(""));
+  String ssidLabel = connected ? WiFi.SSID() : (apMode ? String(AP_SSID_STR) : String(""));
   String ipLabel = connected ? WiFi.localIP().toString() : (apMode ? WiFi.softAPIP().toString() : String("0.0.0.0"));
 
   String page;
@@ -763,12 +784,12 @@ void handleThermostat() {
   if (!signedIn) authNote = "Read-only. <a href='/login'>Sign in</a>.";
   else if (!onNet) {
     if (WiFi.status() != WL_CONNECTED) authNote = "Signed in, but WiFi is offline.";
-    else authNote = "Signed in, but not on " + String(AUTHORIZED_SSID) + ".";
+    else authNote = "Signed in, but not on " + String(AUTHORIZED_SSID_STR) + ".";
   }
   else authNote = "Signed in. <a href='/logout'>Sign out</a>.";
   String wifiLine;
   if (wifiConnected) wifiLine = "WiFi: " + WiFi.SSID() + " | IP: " + wifiIpStr;
-  else if (apMode) wifiLine = "AP: " + String(AP_SSID) + " | IP: " + wifiIpStr;
+  else if (apMode) wifiLine = "AP: " + String(AP_SSID_STR) + " | IP: " + wifiIpStr;
   else wifiLine = "WiFi: disconnected";
 
   String page;
@@ -1106,7 +1127,7 @@ void updateDisplay() {
     display.setCursor(0, 16);
     if (apMode) {
       display.print("AP: ");
-      display.println(AP_SSID);
+      display.println(AP_SSID_STR);
       display.print("Go to http://");
       display.println(wifiIpStr);
     } else {

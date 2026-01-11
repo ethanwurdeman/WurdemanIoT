@@ -19,6 +19,9 @@ pio run -t upload  # flash
 pio device monitor -b 115200  # serial logs
 ```
 
+## Config
+- Shared firmware secrets: `config/firmware_secrets.h` (WiFi, tokens, ingest URL, APN)
+
 ## Behavior
 - Pulls config from `/config` at boot and every 10 minutes.
 - Modes: force (time-bound), home, nearby, roaming based on geofence radii (ft).

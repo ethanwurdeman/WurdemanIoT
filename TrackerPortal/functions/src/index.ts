@@ -1,4 +1,5 @@
 import { onRequest } from "firebase-functions/v2/https";
+import { defineSecret } from "firebase-functions/params";
 import * as logger from "firebase-functions/logger";
 import * as admin from "firebase-admin";
 
@@ -6,8 +7,10 @@ admin.initializeApp();
 const db = admin.firestore();
 const { Timestamp, FieldValue } = admin.firestore;
 
-const DEVICE_TOKEN = process.env.DEVICE_TOKEN || "";
-const THERMOSTAT_TOKEN = process.env.THERMOSTAT_TOKEN || DEVICE_TOKEN;
+const DEVICE_TOKEN_SECRET = defineSecret("DEVICE_TOKEN");
+const THERMOSTAT_TOKEN_SECRET = defineSecret("THERMOSTAT_TOKEN");
+const DEVICE_TOKEN = () => DEVICE_TOKEN_SECRET.value() || process.env.DEVICE_TOKEN || "";
+const THERMOSTAT_TOKEN = () => THERMOSTAT_TOKEN_SECRET.value() || DEVICE_TOKEN();
 const DEFAULT_THERMOSTAT_CONFIG = {
   setpointF: 70,
   diffF: 1,
@@ -81,7 +84,8 @@ export const ingest = onRequest(
   {
     cors: true,
     region: "us-central1",
-    concurrency: 8
+    concurrency: 8,
+    secrets: [DEVICE_TOKEN_SECRET]
   },
   async (req, res) => {
     res.set("Access-Control-Allow-Origin", "*");
@@ -98,14 +102,15 @@ export const ingest = onRequest(
       return;
     }
 
-    if (!DEVICE_TOKEN) {
+    const deviceToken = DEVICE_TOKEN();
+    if (!deviceToken) {
       logger.error("DEVICE_TOKEN env var not set");
       res.status(500).json({ error: "Server auth not configured" });
       return;
     }
 
     const token = (req.get("X-Device-Token") || req.get("x-device-token") || "").trim();
-    if (!token || token !== DEVICE_TOKEN) {
+    if (!token || token !== deviceToken) {
       res.status(401).json({ error: "Unauthorized" });
       return;
     }
@@ -169,7 +174,8 @@ export const ingest = onRequest(
 export const config = onRequest(
   {
     cors: true,
-    region: "us-central1"
+    region: "us-central1",
+    secrets: [DEVICE_TOKEN_SECRET]
   },
   async (req, res) => {
     res.set("Access-Control-Allow-Origin", "*");
@@ -186,14 +192,15 @@ export const config = onRequest(
       return;
     }
 
-    if (!DEVICE_TOKEN) {
+    const deviceToken = DEVICE_TOKEN();
+    if (!deviceToken) {
       logger.error("DEVICE_TOKEN env var not set");
       res.status(500).json({ error: "Server auth not configured" });
       return;
     }
 
     const token = (req.get("X-Device-Token") || req.get("x-device-token") || "").trim();
-    if (!token || token !== DEVICE_TOKEN) {
+    if (!token || token !== deviceToken) {
       res.status(401).json({ error: "Unauthorized" });
       return;
     }
@@ -301,7 +308,8 @@ export const thermostatIngest = onRequest(
   {
     cors: true,
     region: "us-central1",
-    concurrency: 8
+    concurrency: 8,
+    secrets: [THERMOSTAT_TOKEN_SECRET]
   },
   async (req, res) => {
     res.set("Access-Control-Allow-Origin", "*");
@@ -318,14 +326,15 @@ export const thermostatIngest = onRequest(
       return;
     }
 
-    if (!THERMOSTAT_TOKEN) {
+    const thermToken = THERMOSTAT_TOKEN();
+    if (!thermToken) {
       logger.error("THERMOSTAT_TOKEN env var not set");
       res.status(500).json({ error: "Server auth not configured" });
       return;
     }
 
     const token = (req.get("X-Device-Token") || req.get("x-device-token") || "").trim();
-    if (!token || token !== THERMOSTAT_TOKEN) {
+    if (!token || token !== thermToken) {
       res.status(401).json({ error: "Unauthorized" });
       return;
     }
@@ -337,6 +346,8 @@ export const thermostatIngest = onRequest(
       return;
     }
 
+    logger.info("thermostatIngest request", { deviceId });
+
     const status = normalizeThermostatStatus(body);
     const history = normalizeThermostatHistory(body);
 
@@ -344,16 +355,12 @@ export const thermostatIngest = onRequest(
       const ref = db.collection("thermostats").doc(deviceId);
       const snap = await ref.get();
       const existing = snap.exists ? snap.data() : undefined;
-      const existingConfig = normalizeThermostatConfig(existing?.config);
 
       const update: Record<string, unknown> = {
         name: existing?.name ?? deviceId,
         updatedAt: FieldValue.serverTimestamp(),
         status
       };
-      if (!existing?.config) {
-        update.config = existingConfig;
-      }
 
       const batch = db.batch();
       batch.set(ref, update, { merge: true });
@@ -377,7 +384,8 @@ export const thermostatIngest = onRequest(
 export const thermostatConfig = onRequest(
   {
     cors: true,
-    region: "us-central1"
+    region: "us-central1",
+    secrets: [THERMOSTAT_TOKEN_SECRET]
   },
   async (req, res) => {
     res.set("Access-Control-Allow-Origin", "*");
@@ -388,14 +396,15 @@ export const thermostatConfig = onRequest(
       return;
     }
 
-    if (!THERMOSTAT_TOKEN) {
+    const thermToken = THERMOSTAT_TOKEN();
+    if (!thermToken) {
       logger.error("THERMOSTAT_TOKEN env var not set");
       res.status(500).json({ error: "Server auth not configured" });
       return;
     }
 
     const token = (req.get("X-Device-Token") || req.get("x-device-token") || "").trim();
-    if (!token || token !== THERMOSTAT_TOKEN) {
+    if (!token || token !== thermToken) {
       res.status(401).json({ error: "Unauthorized" });
       return;
     }

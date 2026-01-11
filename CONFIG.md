@@ -13,40 +13,42 @@ Single place to see/change secrets, defaults, and paths. Keep this file updated 
 - Firestore rules file: TrackerPortal/firestore.rules
 
 ## Cloud Functions auth
-- DEVICE_TOKEN (ingest) env: currently set via Functions secret (keep same token as below)
-- THERMOSTAT_TOKEN env: set to match thermostat device token (fill in)
+- DEVICE_TOKEN (ingest) env: set via Functions secret
+- THERMOSTAT_TOKEN env: set to match thermostat device token
 
 ## Web client config
 - File: TrackerPortal/public/firebase-config.js
   - firebaseConfig.* matches Firebase above
   - ingestConfig.url: https://us-central1-wurdemaniot.cloudfunctions.net/ingest
   - ingestConfig.deviceId: Tyee
-  - ingestConfig.deviceToken: 7c9e2a41fd64e7d9f13c8a5
+  - ingestConfig.deviceToken: b7c9e2a41fd64e7d9f13c8a5
   - ingestConfig.thermostatId: home
 
-## Thermostat device (ESP32 Nano) — folder device/thermostat
+## Thermostat device (ESP32 Nano) - folder device/thermostat
 - WiFi primary SSID/PASS: Wurdeman Starlink 2.4 / Koda2020
 - Authorized SSID for control: WurdemanIoT
-- Admin login (local web UI): user dmin, pass change-me
-- AP SSID/PASS: Thermostat-Setup / ` (blank)
+- Admin login (local web UI): user admin, pass change-me
+- AP SSID/PASS: Thermostat-Setup / (blank)
+- Firmware defaults (setpoint/diff/mode): 70.0 F / 1.0 F / heat
 - Timezone: default UTC; browser sets offset via /tz
 - Control defaults: setpoint 70.0 F, diff 1.0 F, mode heat
 - Fan timer epoch: stored in firmware (updates via cloud config)
 - Cloud endpoints: THERMOSTAT_INGEST_URL=https://us-central1-wurdemaniot.cloudfunctions.net/thermostatIngest, THERMOSTAT_CONFIG_URL=https://us-central1-wurdemaniot.cloudfunctions.net/thermostatConfig
-- Device token: THERMOSTAT_DEVICE_TOKEN (fill in actual token; currently REPLACE_ME in include/secrets.h)
-- Secrets file: device/thermostat/include/secrets.h (set WiFi + token + endpoints)
+- Device token: THERMOSTAT_DEVICE_TOKEN (set in config/firmware_secrets.h)
+- Firmware config source: config/firmware_secrets.h (shared; includes WiFi/admin/AP/auth tokens/defaults; included via PlatformIO build flags)
 - Firmware source: device/thermostat/src/main.cpp; PlatformIO device/thermostat/platformio.ini
 - Archived old .ino: device/thermostat/archived_thermostat_webui.ino
 
-## Tyee tracker (cellular/Wi-Fi) — folder device/tyee
+## Tyee tracker (cellular/Wi-Fi) - folder device/tyee
 - Ingest base URL: https://ingest-dwoseol4ba-uc.a.run.app
 - Device ID: Tyee
-- Device token: in device/tyee/include/secrets.h (currently REPLACE_ME)
-- WiFi SSID/PASS: in device/tyee/include/secrets.h (currently REPLACE_ME)
+- Device token: set in config/firmware_secrets.h
+- WiFi SSID/PASS: set in config/firmware_secrets.h
 - APN: hologram, user/pass blank
 - Firmware source: (not present in repo; only build artifacts in .pio). Re-add source when available.
+- Firmware secrets source: config/firmware_secrets.h (shared; included via PlatformIO build flags)
 
-## Water Dispenser (ESP32 Nano) — folder device/water-dispenser
+## Water Dispenser (ESP32 Nano) - folder device/water-dispenser
 - No network creds needed (offline)
 - Firmware source: device/water-dispenser/src/main.cpp
 - PlatformIO config: device/water-dispenser/platformio.ini
@@ -58,9 +60,10 @@ Single place to see/change secrets, defaults, and paths. Keep this file updated 
 
 ## Paths to flash
 - Thermostat: device/thermostat (PlatformIO: pio run -t upload)
-- Tyee: device/tyee (source missing; once added, use PlatformIO per board)
+- Tyee: device/tyee (add source; then PlatformIO build/upload)
 - Water Dispenser: device/water-dispenser (PlatformIO: pio run -t upload)
 
 ## Notes
 - Keep this file updated when tokens/keys/SSIDs change.
 - Functions env vars must match device tokens (DEVICE_TOKEN for trackers, THERMOSTAT_TOKEN for thermostat).
+- Shared firmware secrets live in config/firmware_secrets.h.
