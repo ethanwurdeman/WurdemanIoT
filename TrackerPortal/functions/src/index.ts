@@ -660,7 +660,11 @@ function parseMonthStart(value: unknown): string | null {
 }
 
 function normalizeThermostatStatus(body: ThermostatIngestRequest): ThermostatStatus {
-  const ts = parseTimestamp(body.ts) ?? Timestamp.fromMillis(Date.now());
+  let ts = parseTimestamp(body.ts);
+  if (!ts || !isSaneTimestamp(ts)) {
+    // If the device clock is unset (e.g., 1970) or obviously wrong, use server time.
+    ts = Timestamp.fromMillis(Date.now());
+  }
   return {
     ts,
     tempF: toNullableNumber(body.tempF),

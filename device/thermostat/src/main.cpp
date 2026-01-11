@@ -8,6 +8,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <time.h>
+#include <sys/time.h>
 #include <math.h>
 #include "DHT.h"
 #include <ArduinoJson.h>
@@ -1384,6 +1385,20 @@ bool fetchThermostatConfig() {
     if (DEBUG_SERIAL) Serial.printf("[CLOUD] Config parse error: %s\n", err.c_str());
     return false;
   }
+
+  // Sync device time from serverTime if present (helps avoid stale 1970 timestamps before NTP)
+  uint64_t serverMs = doc["serverTime"] | 0ULL;
+  if (serverMs > 0) {
+    struct timeval tv;
+    tv.tv_sec = (time_t)(serverMs / 1000ULL);
+    tv.tv_usec = (suseconds_t)((serverMs % 1000ULL) * 1000ULL);
+    settimeofday(&tv, nullptr);
+    if (DEBUG_SERIAL) {
+      Serial.printf("[TIME] Set from serverTime: %llu ms -> %lu\n",
+                    (unsigned long long)serverMs, (unsigned long)tv.tv_sec);
+    }
+  }
+
   JsonObject config = doc["config"];
   if (config.isNull()) return false;
   applyRemoteConfig(config);
