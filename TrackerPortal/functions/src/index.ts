@@ -10,7 +10,7 @@ const { Timestamp, FieldValue } = admin.firestore;
 const DEVICE_TOKEN_SECRET = defineSecret("DEVICE_TOKEN");
 const THERMOSTAT_TOKEN_SECRET = defineSecret("THERMOSTAT_TOKEN");
 const DEVICE_TOKEN = () => DEVICE_TOKEN_SECRET.value() || process.env.DEVICE_TOKEN || "";
-const THERMOSTAT_TOKEN = () => THERMOSTAT_TOKEN_SECRET.value() || DEVICE_TOKEN();
+const THERMOSTAT_TOKEN = () => THERMOSTAT_TOKEN_SECRET.value() || process.env.THERMOSTAT_TOKEN || "";
 const DEFAULT_THERMOSTAT_CONFIG = {
   setpointF: 70,
   diffF: 1,
