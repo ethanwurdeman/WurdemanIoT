@@ -23,6 +23,10 @@
 #define THERMOSTAT_DEFAULT_DIFF_F 1.0
 #define THERMOSTAT_DEFAULT_MODE "heat"  // heat, cool, fan, off
 
+// --- Weather Underground (outside data) ---
+#define WEATHER_STATION_ID ""      // e.g., "KNEBAYAR10"
+#define WEATHER_API_KEY ""         // weather underground API key (leave blank and set via env where possible)
+
 // --- Tyee tracker (T-SIM7080G-S3) ---
 #define DEVICE_ID "Tyee"
 #define TYEE_DEVICE_TOKEN "b7c9e2a41fd64e7d9f13c8a5"  // tracker ingest token (server secret TYEE_TOKEN)

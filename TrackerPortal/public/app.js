@@ -41,6 +41,7 @@ const DEFAULT_WINDOW_MINUTES = 60;
 const DEFAULT_THERMOSTAT_ID = ingestConfig?.thermostatId || "home";
 const THERMOSTAT_HISTORY_LIMIT = 2000;
 const THERMOSTAT_HISTORY_RENDER_LIMIT = 400;
+const DEFAULT_PROPANE_CAPACITY = 400;
 
 const state = {
   user: null,
@@ -65,6 +66,8 @@ const state = {
   thermostatHistory: [],
   propaneReadings: [],
   propaneStats: null,
+  scheduleNames: [],
+  scheduleZoom: 24,
   thermostatRange: "day",
   debug: {
     deviceError: null,
@@ -76,6 +79,7 @@ const state = {
 
 const routes = [
   { pattern: /^\/home$/, handler: renderHome },
+  { pattern: /^\/pets$/, handler: renderPets },
   { pattern: /^\/dog\/([^/]+)$/, handler: (_path, id) => renderDog(id) },
   { pattern: /^\/pet\/([^/]+)$/, handler: (_path, id) => renderDog(id, "Pet") },
   { pattern: /^\/$/, handler: renderLanding },
@@ -93,7 +97,7 @@ const petsLink = document.getElementById("pets-link");
 
 const defaultDeviceId = ingestConfig?.deviceId || "Tyee";
 if (petsLink) {
-  petsLink.href = `#/pet/${defaultDeviceId}`;
+  petsLink.href = "#/pets";
 }
 
 authForm.addEventListener("submit", async (e) => {
@@ -219,6 +223,25 @@ function renderLanding() {
   `;
 }
 
+function renderPets() {
+  cleanupListeners();
+  const petId = ingestConfig?.deviceId || "Tyee";
+  view.innerHTML = `
+    <div class="section-header">
+      <div>
+        <h2>Pets</h2>
+        <p class="muted">Choose a pet tracker.</p>
+      </div>
+    </div>
+    <div class="card">
+      <div class="actions">
+        <span class="muted">Tyee tracker</span>
+        <a class="btn" href="#/pet/${petId}">Open Tyee</a>
+      </div>
+    </div>
+  `;
+}
+
 function renderThermostat() {
   cleanupListeners();
   const canEdit = !!state.user;
@@ -237,9 +260,13 @@ function renderThermostat() {
         <div class="thermo-metric">
           <div class="thermo-label">Real feel</div>
           <div class="thermo-value" id="thermo-feel">--</div>
+          <div class="thermo-inline">
+            <span class="thermo-inline-value" id="thermo-setpoint-live">--</span>
+            <span class="thermo-inline-label">setpoint</span>
+          </div>
           <div class="thermo-sub">Temperature: <span id="thermo-temp">--</span></div>
           <div class="thermo-sub">Humidity: <span id="thermo-hum">--</span></div>
-          <div class="thermo-sub">Setpoint: <span id="thermo-setpoint-live">--</span></div>
+          <div class="thermo-sub" id="thermo-outside">Outside: --</div>
         </div>
         <div class="thermo-meta" id="thermo-meta">Last update: --</div>
         <div class="thermo-chip-row">
@@ -292,11 +319,17 @@ function renderThermostat() {
       <div class="section-header">
         <h3>Schedule</h3>
         <div class="thermo-schedule-actions">
+          <input class="schedule-input" type="text" id="schedule-name-input" placeholder="Block name" list="schedule-names" />
+          <datalist id="schedule-names"></datalist>
+          <input class="schedule-input" type="number" step="0.5" min="40" max="90" id="schedule-setpoint-input" placeholder="Setpoint (F)" />
+          <button class="btn ghost" type="button" data-zoom="24">24h</button>
+          <button class="btn ghost" type="button" data-zoom="12">12h</button>
+          <button class="btn ghost" type="button" data-zoom="6">6h</button>
           <button class="btn ghost" type="button" id="thermo-schedule-refresh">Refresh</button>
           <button class="btn ghost" type="button" id="thermo-schedule-clear">Clear all</button>
         </div>
       </div>
-      <div class="thermo-schedule-legend">Long-press a day bar to add a setpoint block.</div>
+      <div class="thermo-schedule-legend">Click and drag to set blocks. Hover to see time. Zoom for finer control.</div>
       <div id="thermo-schedule-grid"></div>
       <div class="muted">Blocks are inclusive of the end hour.</div>
     </div>
@@ -321,9 +354,10 @@ function renderThermostat() {
         <div class="propane-form">
           <label>Gallons</label>
           <input type="number" min="0" step="0.1" id="propane-gallons-input" placeholder="e.g. 362" />
-          <label>Capacity (gal)</label>
-          <input type="number" min="1" step="1" id="propane-capacity-input" placeholder="e.g. 400" />
-          <button class="btn" type="button" id="propane-save">Log reading</button>
+          <div class="propane-actions">
+            <button class="btn" type="button" id="propane-save">Log reading</button>
+            <button class="btn ghost" type="button" id="propane-fill">Tank fill</button>
+          </div>
         </div>
       </div>
       <div class="propane-stats" id="propane-stats">No readings yet.</div>
@@ -367,9 +401,14 @@ function bindThermostatControls() {
   const fanClear = document.getElementById("thermo-fan-clear");
   const scheduleRefresh = document.getElementById("thermo-schedule-refresh");
   const scheduleClear = document.getElementById("thermo-schedule-clear");
+  const scheduleZoomBtns = document.querySelectorAll("[data-zoom]");
+  const scheduleNameInput = document.getElementById("schedule-name-input");
+  const scheduleSetpointInput = document.getElementById("schedule-setpoint-input");
+  const scheduleNamesList = document.getElementById("schedule-names");
   const historyRefresh = document.getElementById("thermo-history-refresh");
   const historyButtons = document.querySelectorAll(".thermo-history-actions button[data-range]");
   const propaneSave = document.getElementById("propane-save");
+  const propaneFill = document.getElementById("propane-fill");
   const propaneRefresh = document.getElementById("propane-refresh");
 
   const canEdit = !!state.user;
@@ -430,6 +469,22 @@ function bindThermostatControls() {
   if (scheduleClear) {
     scheduleClear.onclick = () => clearThermostatSchedule();
   }
+  if (scheduleNamesList) {
+    scheduleNamesList.innerHTML = "";
+    (state.scheduleNames || []).forEach((name) => {
+      const opt = document.createElement("option");
+      opt.value = name;
+      scheduleNamesList.appendChild(opt);
+    });
+  }
+  scheduleZoomBtns.forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const zoom = Number(btn.getAttribute("data-zoom")) || 24;
+      state.scheduleZoom = zoom;
+      scheduleZoomBtns.forEach((b) => b.classList.toggle("active", b === btn));
+      renderThermostatSchedule(state.thermostat?.config?.schedule);
+    });
+  });
 
   if (historyRefresh) {
     historyRefresh.onclick = () => loadThermostatHistory(state.thermostatRange);
@@ -443,7 +498,10 @@ function bindThermostatControls() {
   });
 
   if (propaneSave) {
-    propaneSave.onclick = () => savePropaneReading();
+    propaneSave.onclick = () => savePropaneReading(false);
+  }
+  if (propaneFill) {
+    propaneFill.onclick = () => savePropaneReading(true);
   }
   if (propaneRefresh) {
     propaneRefresh.onclick = () => loadPropaneReadings(true);
@@ -459,8 +517,7 @@ function requireThermostatAuth(actionLabel) {
 
 async function updateThermostatConfig(partial) {
   if (!requireThermostatAuth("update thermostat config")) return;
-  const ref = doc(db, "thermostats", state.thermostatId);
-  await setDoc(ref, { config: partial }, { merge: true });
+  queueThermostatConfig(partial);
 }
 
 function adjustThermostatConfig(field, delta, min, max) {
@@ -472,6 +529,24 @@ function adjustThermostatConfig(field, delta, min, max) {
   );
   const next = Math.min(Math.max(current + delta, min), max);
   updateThermostatConfig({ [field]: Number(next.toFixed(1)) });
+}
+
+let configDebounceTimer = null;
+let pendingConfig = {};
+const CONFIG_DEBOUNCE_MS = 2500;
+
+function queueThermostatConfig(partial) {
+  pendingConfig = { ...(pendingConfig || {}), ...partial };
+  if (configDebounceTimer) {
+    clearTimeout(configDebounceTimer);
+  }
+  configDebounceTimer = setTimeout(async () => {
+    const ref = doc(db, "thermostats", state.thermostatId);
+    const payload = pendingConfig;
+    pendingConfig = {};
+    configDebounceTimer = null;
+    await setDoc(ref, { config: payload }, { merge: true });
+  }, CONFIG_DEBOUNCE_MS);
 }
 
 function subscribeThermostat() {
@@ -499,6 +574,7 @@ function updateThermostatUI(data) {
   const tempEl = document.getElementById("thermo-temp");
   const feelEl = document.getElementById("thermo-feel");
   const humEl = document.getElementById("thermo-hum");
+  const outsideEl = document.getElementById("thermo-outside");
   const metaEl = document.getElementById("thermo-meta");
   const modePill = document.getElementById("thermo-mode-pill");
   const outputPill = document.getElementById("thermo-output-pill");
@@ -518,6 +594,7 @@ function updateThermostatUI(data) {
     if (tempEl) tempEl.textContent = "--";
     if (feelEl) feelEl.textContent = "--";
     if (humEl) humEl.textContent = "--";
+    if (outsideEl) outsideEl.textContent = "Outside: --";
     if (metaEl) metaEl.textContent = "Last update: --";
     if (modePill) modePill.innerHTML = `<span class="dot"></span>Mode: --`;
     if (outputPill) outputPill.innerHTML = `<span class="dot"></span>Outputs: --`;
@@ -546,8 +623,23 @@ function updateThermostatUI(data) {
   const temp = status.tempF ?? null;
   const feel = status.heatIndexF ?? null;
   const hum = status.humidity ?? null;
-  if (tempEl) tempEl.textContent = temp != null ? `${Number(temp).toFixed(1)} F` : "--";
-  if (feelEl) feelEl.textContent = feel != null ? `${Number(feel).toFixed(1)} F` : "--";
+  const spLive = status.setpointF ?? config.setpointF ?? null;
+  if (feelEl) {
+    feelEl.textContent = feel != null ? `${Number(feel).toFixed(1)} F` : "--";
+    feelEl.className = "thermo-value";
+    const hotter = spLive != null && feel != null && feel > spLive;
+    const cooler = spLive != null && feel != null && feel < spLive;
+    feelEl.style.color = hotter ? "#ef4444" : cooler ? "#38bdf8" : "";
+  }
+  if (tempEl) {
+    tempEl.textContent = temp != null ? `${Number(temp).toFixed(1)} F` : "--";
+    tempEl.style.color = "";
+  }
+  if (humEl) humEl.textContent = hum != null ? `${Number(hum).toFixed(0)} %` : "--";
+  if (outsideEl) {
+    // Placeholder until outside data is wired
+    outsideEl.textContent = "Outside: -- temp | -- hum | wind -- / gust -- | precip --";
+  }
   if (humEl) humEl.textContent = hum != null ? `${Number(hum).toFixed(0)} %` : "--";
 
   if (metaEl) {
@@ -555,13 +647,19 @@ function updateThermostatUI(data) {
   }
 
   const mode = (status.mode || config.mode || "--").toString();
+  const lastRunStart = status.ts ? toDate(status.ts) : null;
+  const durationMin = status.heatCycleSec ? Number(status.heatCycleSec) / 60 : null;
   if (modePill) {
-    modePill.className = `pill ${thermostatModeClass(mode)}`;
-    modePill.innerHTML = `<span class="dot"></span>Mode: ${mode}`;
+    modePill.className = `pill ${status.heatOn || status.coolOn ? "online" : "offline"}`;
+    const durLabel = durationMin != null ? ` | Duration: ${durationMin.toFixed(1)} min` : "";
+    const startLabel = lastRunStart ? `Last run: ${formatTimeOfDay(lastRunStart)}` : "Last run: --";
+    modePill.innerHTML = `<span class="dot"></span>${startLabel}${durLabel}`;
   }
 
-  const outputs = `Heat ${status.heatOn ? "ON" : "OFF"} | Cool ${status.coolOn ? "ON" : "OFF"} | Fan ${status.fanOn ? "ON" : "OFF"}`;
-  if (outputPill) outputPill.innerHTML = `<span class="dot"></span>${outputs}`;
+  if (outputPill) {
+    outputPill.className = "pill";
+    outputPill.innerHTML = `<span class="dot"></span>Mode: ${mode}`;
+  }
 
   if (scheduleEl) {
     const schedLabel = status.scheduleActive ? "Scheduled" : "Manual";
@@ -589,6 +687,7 @@ function updateThermostatUI(data) {
   if (setpointLiveEl) {
     const sp = status.setpointF ?? config.setpointF;
     setpointLiveEl.textContent = sp != null ? `${Number(sp).toFixed(1)} F` : "--";
+    setpointLiveEl.style.color = "#ec4899";
   }
   if (diffEl) {
     const diff = config.diffF ?? status.diffF;
@@ -624,34 +723,7 @@ function renderThermostatSchedule(rawSchedule) {
   const dayOrder = [1, 2, 3, 4, 5, 6, 0];
 
   wrap.innerHTML = "";
-  let pressTimer = null;
-
-  function cancelPress() {
-    if (pressTimer) {
-      clearTimeout(pressTimer);
-      pressTimer = null;
-    }
-  }
-
-  function startPress(ev, dayIdx, bar) {
-    if (!canEdit) return;
-    cancelPress();
-    pressTimer = setTimeout(() => {
-      pressTimer = null;
-      createBlock(ev, dayIdx, bar);
-    }, 500);
-  }
-
-  function createBlock(ev, dayIdx, bar) {
-    const rect = bar.getBoundingClientRect();
-    const pct = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
-    const start = Math.floor(pct * 24);
-    const duration = parseInt(prompt(`Duration hours (1-24) starting at ${start}:00`, "2") || "0", 10);
-    if (!duration || duration < 1 || duration > 24) return;
-    const end = (start + duration - 1) % 24;
-    const sp = parseFloat(prompt("Setpoint (F)", "70") || "70");
-    applyScheduleBlock(dayIdx, start, end, sp);
-  }
+  let dragStart = null;
 
   function addSeg(bar, start, end, sp) {
     if (start < 0 || end < start) return;
@@ -670,11 +742,83 @@ function renderThermostatSchedule(rawSchedule) {
     const hours = schedule[dayIdx];
     const row = document.createElement("div");
     row.className = "thermo-day-row";
-    row.innerHTML = `<div class="thermo-day-name">${dayNames[displayIdx]}</div><div class="thermo-day-bar" data-day="${dayIdx}"></div>`;
+    row.innerHTML = `<div class="thermo-day-name">${dayNames[displayIdx]}</div><div class="thermo-day-bar" data-day="${dayIdx}"><div class="thermo-hover-line"></div><div class="thermo-ticks"></div></div>`;
     const bar = row.querySelector(".thermo-day-bar");
-    bar.addEventListener("pointerdown", (e) => startPress(e, dayIdx, bar));
-    bar.addEventListener("pointerup", cancelPress);
-    bar.addEventListener("pointerleave", cancelPress);
+    const hoverLine = bar.querySelector(".thermo-hover-line");
+    const ticks = bar.querySelector(".thermo-ticks");
+    const zoom = state.scheduleZoom || 24;
+    ticks.innerHTML = "";
+    const tickEvery = zoom >= 24 ? 3 : zoom >= 12 ? 1 : 0.5;
+    for (let hTick = 0; hTick <= 24; hTick += tickEvery) {
+      const tick = document.createElement("div");
+      tick.className = "tick";
+      tick.style.left = `${(hTick / 24) * 100}%`;
+      ticks.appendChild(tick);
+    }
+
+    function hourFromEvent(ev) {
+      const rect = bar.getBoundingClientRect();
+      const pct = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
+      return Math.round(pct * 23);
+    }
+
+    function updateHover(ev) {
+      const rect = bar.getBoundingClientRect();
+      const pct = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
+      hoverLine.style.left = `${pct * 100}%`;
+      hoverLine.style.display = "block";
+      hoverLine.textContent = `${Math.round(pct * 23)}:00`;
+    }
+
+    function clearHover() {
+      hoverLine.style.display = "none";
+    }
+
+    function applyDrag(endHour) {
+      if (!canEdit || dragStart == null) return;
+      const startHour = Math.min(dragStart, endHour);
+      const finalEnd = Math.max(dragStart, endHour);
+      const defaultSp = Number(state.thermostat?.config?.setpointF ?? state.thermostat?.status?.setpointF ?? 70);
+      let spInput = Number(scheduleSetpointInput?.value);
+      if (!Number.isFinite(spInput)) spInput = defaultSp;
+      const sp = spInput;
+      if (!Number.isFinite(sp)) return;
+      let name = (scheduleNameInput?.value || "").trim();
+      const existingNames = state.scheduleNames || [];
+      if (!name && existingNames.length) {
+        name = existingNames[existingNames.length - 1];
+      }
+      if (name && !existingNames.includes(name)) {
+        state.scheduleNames.push(name);
+        if (scheduleNamesList) {
+          const opt = document.createElement("option");
+          opt.value = name;
+          scheduleNamesList.appendChild(opt);
+        }
+      }
+      applyScheduleBlock(dayIdx, startHour, finalEnd, sp);
+      dragStart = null;
+    }
+
+    bar.addEventListener("pointerdown", (e) => {
+      if (!canEdit) return;
+      dragStart = hourFromEvent(e);
+      bar.setPointerCapture(e.pointerId);
+    });
+    bar.addEventListener("pointermove", (e) => {
+      updateHover(e);
+    });
+    bar.addEventListener("pointerup", (e) => {
+      if (dragStart != null) {
+        applyDrag(hourFromEvent(e));
+      }
+      bar.releasePointerCapture(e.pointerId);
+      dragStart = null;
+    });
+    bar.addEventListener("pointerleave", () => {
+      clearHover();
+      dragStart = null;
+    });
 
     let start = -1;
     let lastSp = null;
@@ -761,7 +905,9 @@ async function loadThermostatHistory(range) {
       points.push({
         ts,
         tempF: d.tempF != null ? Number(d.tempF) : null,
-        setpointF: d.setpointF != null ? Number(d.setpointF) : null
+        setpointF: d.setpointF != null ? Number(d.setpointF) : null,
+        heatCycleSec: d.heatCycleSec != null ? Number(d.heatCycleSec) : null,
+        burnSec: d.burnSec != null ? Number(d.burnSec) : null
       });
     });
     state.thermostatHistory = points;
@@ -778,7 +924,8 @@ function drawThermostatHistory(points, range) {
   const ctx = canvas.getContext("2d");
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-  if (!points.length) {
+  const propane = state.propaneReadings || [];
+  if (!points.length && !propane.length) {
     ctx.fillStyle = "#94a3b8";
     ctx.fillText("No history yet.", 20, 30);
     return;
@@ -786,10 +933,16 @@ function drawThermostatHistory(points, range) {
 
   const temps = points.map((p) => p.tempF).filter((v) => v != null);
   const sets = points.map((p) => p.setpointF).filter((v) => v != null);
-  const minVal = Math.min(...temps, ...sets);
-  const maxVal = Math.max(...temps, ...sets);
-  const minTs = points[0].ts.getTime();
-  const maxTs = points[points.length - 1].ts.getTime();
+  const runtime = points.map((p) => p.heatCycleSec != null ? Number(p.heatCycleSec) / 60 : null).filter((v) => v != null);
+  const propanePercents = propane.map((r) => Math.min(100, Math.max(0, (r.level / (r.capacity || DEFAULT_PROPANE_CAPACITY)) * 100)));
+  const minVal = Math.min(...temps, ...sets, ...runtime, ...propanePercents);
+  const maxVal = Math.max(...temps, ...sets, ...runtime, ...propanePercents);
+  const allTs = [
+    ...points.map((p) => p.ts.getTime()),
+    ...propane.map((r) => r.ts.getTime())
+  ].sort((a, b) => a - b);
+  const minTs = allTs[0] || Date.now();
+  const maxTs = allTs[allTs.length - 1] || (Date.now() + 1);
   const pad = 30;
   const h = canvas.height - 2 * pad;
   const w = canvas.width - 2 * pad;
@@ -802,15 +955,15 @@ function drawThermostatHistory(points, range) {
     if (maxTs === minTs) return pad + w / 2;
     return pad + ((t - minTs) / (maxTs - minTs)) * w;
   }
-  function line(color, key) {
+  function line(color, key, series) {
     ctx.beginPath();
     ctx.strokeStyle = color;
     ctx.lineWidth = 2;
     let first = true;
-    points.forEach((p) => {
+    series.forEach((p) => {
       const v = p[key];
       if (v == null) return;
-      const px = x(p.ts.getTime());
+      const px = x(p.ts);
       const py = y(v);
       if (first) {
         ctx.moveTo(px, py);
@@ -822,8 +975,10 @@ function drawThermostatHistory(points, range) {
     ctx.stroke();
   }
 
-  line("#2f74ff", "setpointF");
-  line("#30d158", "tempF");
+  line("#2f74ff", "value", points.map((p) => ({ ts: p.ts.getTime(), value: p.setpointF })));
+  line("#30d158", "value", points.map((p) => ({ ts: p.ts.getTime(), value: p.tempF })));
+  line("#f97316", "value", points.map((p) => ({ ts: p.ts.getTime(), value: p.heatCycleSec != null ? Number(p.heatCycleSec) / 60 : null })));
+  line("#38bdf8", "value", propane.map((r, idx) => ({ ts: r.ts.getTime(), value: propanePercents[idx] })));
 
   ctx.strokeStyle = "#222a35";
   ctx.lineWidth = 1;
@@ -903,7 +1058,7 @@ async function loadPropaneReadings(force = false) {
   renderPropane(readings);
 }
 
-async function savePropaneReading() {
+async function savePropaneReading(isFill = false) {
   if (!requireThermostatAuth("log propane")) return;
   const levelInput = document.getElementById("propane-gallons-input");
   const capInput = document.getElementById("propane-capacity-input");
@@ -921,6 +1076,7 @@ async function savePropaneReading() {
   await addDoc(ref, {
     levelGallons: level,
     capacityGallons: capacity,
+    filled: !!isFill,
     ts: Timestamp.now()
   });
   if (levelInput) levelInput.value = "";
@@ -931,7 +1087,6 @@ function renderPropane(readings) {
   const galEl = document.getElementById("propane-gallons");
   const etaEl = document.getElementById("propane-eta");
   const statsEl = document.getElementById("propane-stats");
-  const capInput = document.getElementById("propane-capacity-input");
 
   if (!readings.length) {
     if (pctEl) pctEl.textContent = "--";
@@ -944,15 +1099,13 @@ function renderPropane(readings) {
 
   const latest = readings[0];
   const level = Math.max(0, latest.level);
-  const capacity = Math.max(1, latest.capacity || 400);
+  const capacity = Math.max(1, latest.capacity || DEFAULT_PROPANE_CAPACITY);
   const percent = Math.min(100, Math.max(0, (level / capacity) * 100));
   if (pctEl) {
     pctEl.textContent = `${percent.toFixed(1)}%`;
     pctEl.style.color = propaneColor(percent);
   }
   if (galEl) galEl.textContent = `${level.toFixed(1)} gal / ${capacity} gal`;
-
-  if (capInput && !capInput.value) capInput.value = capacity;
 
   const stats = computePropaneStats(readings);
   state.propaneStats = stats;
@@ -971,7 +1124,7 @@ function renderPropane(readings) {
   }
   if (statsEl) {
     statsEl.textContent = stats.usagePerDay != null
-      ? `Usage (avg): ${stats.usagePerDay.toFixed(2)} gal/day, ${stats.usagePerWeek.toFixed(1)} gal/wk, ${stats.usagePerMonth.toFixed(1)} gal/mo${cycleLabel ? " | " + cycleLabel + burnLabel : ""}`
+      ? `Usage since ${stats.baselineTs ? formatDate(stats.baselineTs) : "last fill"}: ${stats.usagePerDay.toFixed(2)} gal/day, ${stats.usagePerWeek.toFixed(1)} gal/wk, ${stats.usagePerMonth.toFixed(1)} gal/mo${cycleLabel ? " | " + cycleLabel + burnLabel : ""}`
       : `Need at least two readings to compute usage.${cycleLabel ? " " + cycleLabel + burnLabel : ""}`;
   }
 
@@ -979,20 +1132,25 @@ function renderPropane(readings) {
 }
 
 function computePropaneStats(readings) {
-  if (!readings?.length) return { usagePerDay: null, usagePerWeek: null, usagePerMonth: null, etaDays: null };
+  if (!readings?.length) return { usagePerDay: null, usagePerWeek: null, usagePerMonth: null, etaDays: null, baselineTs: null };
   const sorted = [...readings].sort((a, b) => a.ts.getTime() - b.ts.getTime());
-  if (sorted.length < 2) return { usagePerDay: null, usagePerWeek: null, usagePerMonth: null, etaDays: null };
-  const first = sorted[0];
+  const baselineIdx = (() => {
+    for (let i = sorted.length - 1; i >= 0; i--) {
+      if (sorted[i].filled) return i;
+    }
+    return 0;
+  })();
+  const start = sorted[baselineIdx];
   const last = sorted[sorted.length - 1];
-  const days = Math.max((last.ts.getTime() - first.ts.getTime()) / (1000 * 60 * 60 * 24), 0.01);
-  const used = (first.level - last.level);
+  const days = Math.max((last.ts.getTime() - start.ts.getTime()) / (1000 * 60 * 60 * 24), 0.01);
+  const used = Math.max(0, start.level - last.level);
   const usagePerDay = used > 0 ? used / days : 0;
   const usagePerWeek = usagePerDay * 7;
   const usagePerMonth = usagePerDay * 30;
-  const capacity = last.capacity || 400;
+  const capacity = last.capacity || DEFAULT_PROPANE_CAPACITY;
   const targetLevel = capacity * 0.2;
   const etaDays = usagePerDay > 0 ? (Math.max(0, last.level - targetLevel) / usagePerDay) : null;
-  return { usagePerDay, usagePerWeek, usagePerMonth, etaDays };
+  return { usagePerDay, usagePerWeek, usagePerMonth, etaDays, baselineTs: start.ts };
 }
 
 function propaneColor(percent) {

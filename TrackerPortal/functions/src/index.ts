@@ -8,6 +8,8 @@ const { Timestamp, FieldValue } = admin.firestore;
 
 const TYEE_TOKEN = () => process.env.TYEE_TOKEN || "";
 const THERMOSTAT_TOKEN = () => process.env.THERMOSTAT_TOKEN || "";
+const WU_STATION_ID = () => process.env.WU_STATION_ID || "";
+const WU_API_KEY = () => process.env.WU_API_KEY || "";
 const DEFAULT_THERMOSTAT_CONFIG = {
   setpointF: 70,
   diffF: 1,
@@ -281,6 +283,18 @@ interface ThermostatHistoryPoint {
   ts: admin.firestore.Timestamp;
   tempF: number | null;
   setpointF: number | null;
+  heatCycleSec?: number | null;
+  burnSec?: number | null;
+}
+
+interface OutsideReading {
+  ts: admin.firestore.Timestamp;
+  tempF: number | null;
+  feelsF: number | null;
+  humidity: number | null;
+  windMph: number | null;
+  windGustMph: number | null;
+  precipIn: number | null;
 }
 
 interface ThermostatConfigShape {
@@ -330,6 +344,13 @@ export const thermostatIngest = onRequest(
 
     const status = normalizeThermostatStatus(body);
     const history = normalizeThermostatHistory(body);
+    logger.info("thermostatIngest normalized", {
+      deviceId,
+      statusTs: status.ts?.toMillis?.() ?? null,
+      historyPoints: history.length,
+      historyFirst: history[0]?.ts?.toMillis?.() ?? null,
+      historyLast: history[history.length - 1]?.ts?.toMillis?.() ?? null
+    });
 
     try {
       const ref = db.collection("thermostats").doc(deviceId);
@@ -350,6 +371,9 @@ export const thermostatIngest = onRequest(
         batch.set(histRef, point, { merge: true });
       });
       await batch.commit();
+
+      // Fetch and store outside weather alongside thermostat data
+      await fetchAndStoreOutside(deviceId);
 
       res.status(200).json({ status: "ok", deviceId });
       return;
@@ -677,23 +701,85 @@ function normalizeThermostatHistory(body: ThermostatIngestRequest): ThermostatHi
   const points: ThermostatHistoryPoint[] = [];
   const history = Array.isArray(body.history) ? body.history : [];
   history.forEach((raw) => {
-    const ts = parseTimestamp(raw.ts);
+    let ts = parseTimestamp(raw.ts);
+    if (!ts || !isSaneTimestamp(ts)) {
+      ts = Timestamp.fromMillis(Date.now());
+    }
     if (!ts) return;
     const tempF = toNullableNumber(raw.tempF);
     const setpointF = toNullableNumber(raw.setpointF);
-    points.push({ ts, tempF, setpointF });
+    const heatCycleSec = toNullableNumber((raw as { heatCycleSec?: unknown }).heatCycleSec);
+    const burnSec = toNullableNumber((raw as { burnSec?: unknown }).burnSec);
+    points.push({ ts, tempF, setpointF, heatCycleSec, burnSec });
   });
 
   if (!points.length) {
-    const ts = parseTimestamp(body.ts);
+    let ts = parseTimestamp(body.ts);
+    if (!ts || !isSaneTimestamp(ts)) {
+      ts = Timestamp.fromMillis(Date.now());
+    }
     const tempF = toNullableNumber(body.tempF);
     const setpointF = toNullableNumber(body.setpointF);
+    const heatCycleSec = toNullableNumber(body.heatCycleSec);
+    const burnSec = toNullableNumber(body.burnSec);
     if (ts && (tempF !== null || setpointF !== null)) {
-      points.push({ ts, tempF, setpointF });
+      points.push({ ts, tempF, setpointF, heatCycleSec, burnSec });
     }
   }
 
   return points;
+}
+
+async function fetchAndStoreOutside(deviceId: string) {
+  const stationId = WU_STATION_ID();
+  const apiKey = WU_API_KEY();
+  if (!stationId || !apiKey) {
+    return;
+  }
+  const url = `https://api.weather.com/v2/pws/observations/current?stationId=${encodeURIComponent(
+    stationId
+  )}&format=json&units=e&apiKey=${encodeURIComponent(apiKey)}`;
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      logger.warn("WU fetch failed", { status: resp.status });
+      return;
+    }
+    const data = (await resp.json()) as {
+      observations?: Array<{
+        epoch?: number;
+        imperial?: {
+          temp?: number;
+          heatIndex?: number;
+          humidity?: number;
+          windSpeed?: number;
+          windGust?: number;
+          precipRate?: number;
+        };
+      }>;
+    };
+    const obs = data?.observations?.[0];
+    if (!obs) return;
+    const ts = obs.epoch ? Timestamp.fromMillis(obs.epoch * 1000) : Timestamp.fromMillis(Date.now());
+    const imperial = obs.imperial || {};
+    const reading: OutsideReading = {
+      ts,
+      tempF: toNullableNumber(imperial.temp),
+      feelsF: toNullableNumber(imperial.heatIndex),
+      humidity: toNullableNumber(imperial.humidity),
+      windMph: toNullableNumber(imperial.windSpeed),
+      windGustMph: toNullableNumber(imperial.windGust),
+      precipIn: toNullableNumber(imperial.precipRate)
+    };
+    const ref = db.collection("thermostats").doc(deviceId);
+    const outsideColl = ref.collection("outside").doc(String(ts.toMillis()));
+    await Promise.all([
+      outsideColl.set(reading),
+      ref.set({ outside: reading, outsideUpdatedAt: FieldValue.serverTimestamp() }, { merge: true })
+    ]);
+  } catch (err) {
+    logger.warn("WU fetch error", err as Error);
+  }
 }
 
 function normalizeThermostatConfig(

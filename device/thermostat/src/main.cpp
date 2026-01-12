@@ -116,7 +116,7 @@ unsigned long lastSdWriteMs = 0;
 bool lastSdWriteOk = true;
 const char* lastSdError = "none";
 unsigned long sdWriteFailures = 0;
-const unsigned long CLOUD_PUSH_INTERVAL_MS = 300000;
+const unsigned long CLOUD_PUSH_INTERVAL_MS = 120000;
 const unsigned long CONFIG_FETCH_INTERVAL_MS = 120000;
 const unsigned long CONFIG_PUSH_INTERVAL_MS = 15000;
 unsigned long lastCloudPush = 0;
@@ -1323,7 +1323,7 @@ void tickCloudSync() {
   unsigned long now = millis();
 
   float ctlTemp = lastCtlTemp;
-  bool tempDelta = !isnan(ctlTemp) && (isnan(lastPushedCtlTemp) || fabs(ctlTemp - lastPushedCtlTemp) >= 1.0f);
+  bool tempDelta = !isnan(ctlTemp) && (isnan(lastPushedCtlTemp) || fabs(ctlTemp - lastPushedCtlTemp) >= 0.2f);
   bool setpointDelta = isnan(lastPushedSetpoint) || fabs(setpointF - lastPushedSetpoint) >= 0.01f;
   bool outputDelta = (heatOn != lastPushedHeat) || (coolOn != lastPushedCool) || (fanOn != lastPushedFan);
   if (tempDelta || setpointDelta || outputDelta) {
