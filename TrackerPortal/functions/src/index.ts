@@ -748,6 +748,7 @@ async function fetchAndStoreOutside(deviceId: string) {
     const data = (await resp.json()) as {
       observations?: Array<{
         epoch?: number;
+        humidity?: number;
         imperial?: {
           temp?: number;
           heatIndex?: number;
@@ -766,7 +767,7 @@ async function fetchAndStoreOutside(deviceId: string) {
       ts,
       tempF: toNullableNumber(imperial.temp),
       feelsF: toNullableNumber(imperial.heatIndex),
-      humidity: toNullableNumber(imperial.humidity),
+      humidity: toNullableNumber(imperial.humidity ?? obs.humidity),
       windMph: toNullableNumber(imperial.windSpeed),
       windGustMph: toNullableNumber(imperial.windGust),
       precipIn: toNullableNumber(imperial.precipRate)

@@ -522,6 +522,57 @@ a {
   color: #0b1221;
 }
 
+.propane-oval-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.propane-oval {
+  position: relative;
+  width: 80px;
+  height: 140px;
+  border-radius: 999px;
+  background: #0b1221;
+  box-shadow: inset 0 0 0 1px #222a35;
+  overflow: hidden;
+}
+
+.propane-fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 100%;
+  height: 0%;
+  bottom: 0;
+  background: #38bdf8;
+  transition: width 0.3s ease;
+}
+
+.propane-oval-percent {
+  font-weight: 700;
+  color: #fff;
+  min-width: 60px;
+  display: inline-block;
+}
+
+.propane-meta {
+  display: grid;
+  gap: 4px;
+  margin: 10px 0 4px;
+}
+
+.propane-form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
+}
+
+.propane-card .propane-form input {
+  width: 100%;
+}
+
 .propane-stats {
   word-break: break-word;
 }
@@ -530,6 +581,24 @@ a {
   width: 100%;
   max-width: 100%;
   display: block;
+}
+
+.chart-hover {
+  color: var(--muted);
+  font-size: 13px;
+  margin-bottom: 8px;
+}
+
+#thermo-chart-indoor,
+#thermo-chart-outside {
+  width: 100%;
+  border-radius: 12px;
+  background: #0b1221;
+  box-shadow: inset 0 0 0 1px #222a35;
+}
+
+.outside-metric .thermo-value {
+  color: #ec4899;
 }
 
 @media (max-width: 600px) {
@@ -639,25 +708,12 @@ a {
   margin-right: 6px;
 }
 
-#thermo-chart {
+#thermo-chart-indoor,
+#thermo-chart-outside {
   width: 100%;
-  height: 360px;
   border-radius: 12px;
   background: #0b1221;
   box-shadow: inset 0 0 0 1px #222a35;
-}
-
-.propane-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 12px;
-  align-items: center;
-}
-
-.propane-actions {
-  display: flex;
-  gap: 8px;
-  margin-top: 8px;
 }
 
 .footer {
@@ -687,7 +743,8 @@ a {
     flex: 1 1 140px;
   }
 
-  #thermo-chart {
-    height: 280px;
+  #thermo-chart-indoor,
+  #thermo-chart-outside {
+    height: 240px;
   }
 }
