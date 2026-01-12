@@ -1,5 +1,4 @@
 import { onRequest } from "firebase-functions/v2/https";
-import { defineSecret } from "firebase-functions/params";
 import * as logger from "firebase-functions/logger";
 import * as admin from "firebase-admin";
 
@@ -7,10 +6,8 @@ admin.initializeApp();
 const db = admin.firestore();
 const { Timestamp, FieldValue } = admin.firestore;
 
-const TYEE_TOKEN_SECRET = defineSecret("TYEE_TOKEN");
-const THERMOSTAT_TOKEN_SECRET = defineSecret("THERMOSTAT_TOKEN");
-const TYEE_TOKEN = () => TYEE_TOKEN_SECRET.value() || process.env.TYEE_TOKEN || "";
-const THERMOSTAT_TOKEN = () => THERMOSTAT_TOKEN_SECRET.value() || process.env.THERMOSTAT_TOKEN || "";
+const TYEE_TOKEN = () => process.env.TYEE_TOKEN || "";
+const THERMOSTAT_TOKEN = () => process.env.THERMOSTAT_TOKEN || "";
 const DEFAULT_THERMOSTAT_CONFIG = {
   setpointF: 70,
   diffF: 1,
@@ -84,8 +81,7 @@ export const tyee_ingest = onRequest(
   {
     cors: true,
     region: "us-central1",
-    concurrency: 8,
-    secrets: [TYEE_TOKEN_SECRET]
+    concurrency: 8
   },
   async (req, res) => {
     res.set("Access-Control-Allow-Origin", "*");
@@ -103,14 +99,8 @@ export const tyee_ingest = onRequest(
     }
 
     const deviceToken = TYEE_TOKEN();
-    if (!deviceToken) {
-      logger.error("TYEE_TOKEN env var not set");
-      res.status(500).json({ error: "Server auth not configured" });
-      return;
-    }
-
     const token = (req.get("X-Device-Token") || req.get("x-device-token") || "").trim();
-    if (!token || token !== deviceToken) {
+    if (!deviceToken || !token || token !== deviceToken) {
       res.status(401).json({ error: "Unauthorized" });
       return;
     }
@@ -174,8 +164,7 @@ export const tyee_ingest = onRequest(
 export const tyee_config = onRequest(
   {
     cors: true,
-    region: "us-central1",
-    secrets: [TYEE_TOKEN_SECRET]
+    region: "us-central1"
   },
   async (req, res) => {
     res.set("Access-Control-Allow-Origin", "*");
@@ -193,14 +182,8 @@ export const tyee_config = onRequest(
     }
 
     const deviceToken = TYEE_TOKEN();
-    if (!deviceToken) {
-      logger.error("TYEE_TOKEN env var not set");
-      res.status(500).json({ error: "Server auth not configured" });
-      return;
-    }
-
     const token = (req.get("X-Device-Token") || req.get("x-device-token") || "").trim();
-    if (!token || token !== deviceToken) {
+    if (!deviceToken || !token || token !== deviceToken) {
       res.status(401).json({ error: "Unauthorized" });
       return;
     }
@@ -313,7 +296,6 @@ export const thermostatIngest = onRequest(
     cors: true,
     region: "us-central1",
     concurrency: 8,
-    secrets: [THERMOSTAT_TOKEN_SECRET]
   },
   async (req, res) => {
     res.set("Access-Control-Allow-Origin", "*");
@@ -331,14 +313,8 @@ export const thermostatIngest = onRequest(
     }
 
     const thermToken = THERMOSTAT_TOKEN();
-    if (!thermToken) {
-      logger.error("THERMOSTAT_TOKEN env var not set");
-      res.status(500).json({ error: "Server auth not configured" });
-      return;
-    }
-
     const token = (req.get("X-Device-Token") || req.get("x-device-token") || "").trim();
-    if (!token || token !== thermToken) {
+    if (!thermToken || !token || token !== thermToken) {
       res.status(401).json({ error: "Unauthorized" });
       return;
     }
@@ -388,8 +364,7 @@ export const thermostatIngest = onRequest(
 export const thermostatConfig = onRequest(
   {
     cors: true,
-    region: "us-central1",
-    secrets: [THERMOSTAT_TOKEN_SECRET]
+    region: "us-central1"
   },
   async (req, res) => {
     res.set("Access-Control-Allow-Origin", "*");
