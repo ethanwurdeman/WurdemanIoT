@@ -2007,7 +2007,7 @@ async function loadGeofences(deviceId) {
     const ref = doc(db, "devices", deviceId);
     const snap = await getDoc(ref);
     const data = snap.data();
-    state.geofencePolygons = (data?.geofences as Record<string, { polygon?: Array<{ lat: number; lng: number }> }>) || {};
+    state.geofencePolygons = (data && data.geofences) || {};
     renderGeofencePolygon(state.selectedGeofence || "nearby");
   } catch (err) {
     console.error("Failed to load geofences", err);
