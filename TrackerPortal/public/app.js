@@ -10,6 +10,7 @@ import {
   collection,
   doc,
   endAt,
+  getDoc,
   getDocs,
   limit,
   onSnapshot,
@@ -42,6 +43,7 @@ const DEFAULT_THERMOSTAT_ID = ingestConfig?.thermostatId || "home";
 const THERMOSTAT_HISTORY_LIMIT = 2000;
 const THERMOSTAT_HISTORY_RENDER_LIMIT = 400;
 const DEFAULT_PROPANE_CAPACITY = 400;
+const GEOFENCE_NAMES = ["nearby", "roaming"];
 
 const state = {
   user: null,
@@ -51,14 +53,17 @@ const state = {
   map: null,
   marker: null,
   polyline: null,
+  geofencePolygons: {},
+  drawingManager: null,
+  selectedGeofence: "nearby",
   lastDeviceId: null,
   selectedDay: null,
-  timelineCursorMin: 0,
   historyWindowMinutes: DEFAULT_WINDOW_MINUTES,
   historyPoints: [],
   currentConfig: null,
   lastSnapshot: null,
   thermostatUnsub: null,
+  pendingNet: null,
   propaneUnsub: null,
   thermostatHistoryTimer: null,
   thermostatId: DEFAULT_THERMOSTAT_ID,
@@ -70,6 +75,13 @@ const state = {
   scheduleNames: [],
   scheduleZoom: 24,
   thermostatRange: "day",
+  timelineStartMin: 0,
+  timelineEndMin: 1440,
+  timelineHoverTs: null,
+  historyMarkers: [],
+  hoverMarker: null,
+  mapInfoWindow: null,
+  timelineMouseUpHandler: null,
   debug: {
     deviceError: null,
     devicesError: null,
@@ -78,12 +90,42 @@ const state = {
   }
 };
 
+let googleMapsPromise = null;
+
+async function loadGoogleMaps() {
+  if (window.google?.maps) return window.google.maps;
+  if (!googleMapsPromise) {
+    const key = ingestConfig?.googleMapsApiKey || window.googleMapsApiKey || "";
+    if (!key) {
+      console.error("Google Maps API key missing. Set ingestConfig.googleMapsApiKey in public/firebase-config.js");
+      googleMapsPromise = Promise.resolve(null);
+    } else {
+      googleMapsPromise = new Promise((resolve, reject) => {
+        const script = document.createElement("script");
+        const libs = ingestConfig?.googleMapsLibraries || "drawing";
+        script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(key)}&libraries=${encodeURIComponent(libs)}`;
+        script.async = true;
+        script.onload = () => resolve(window.google.maps);
+        script.onerror = (err) => reject(err);
+        document.head.appendChild(script);
+      });
+    }
+  }
+  try {
+    return await googleMapsPromise;
+  } catch (err) {
+    console.error("Google Maps failed to load", err);
+    return null;
+  }
+}
+
 const routes = [
   { pattern: /^\/home$/, handler: renderHome },
   { pattern: /^\/pets$/, handler: renderPets },
   { pattern: /^\/dog\/([^/]+)$/, handler: (_path, id) => renderDog(id) },
   { pattern: /^\/pet\/([^/]+)$/, handler: (_path, id) => renderDog(id, "Pet") },
   { pattern: /^\/$/, handler: renderLanding },
+  { pattern: /^\/doghouse$/, handler: renderDogHouse },
   { pattern: /^\/thermostat$/, handler: renderThermostat }
 ];
 
@@ -240,6 +282,89 @@ function renderPets() {
         <a class="btn" href="#/pet/${petId}">Open Tyee</a>
       </div>
     </div>
+    <div class="card" style="margin-top:12px">
+      <div class="actions">
+        <span class="muted">Dog House</span>
+        <a class="btn" href="#/doghouse">Open Dog House</a>
+      </div>
+    </div>
+  `;
+}
+
+function renderDogHouse() {
+  cleanupListeners();
+  view.innerHTML = `
+    <div class="section-header">
+      <div>
+        <h2>Dog House</h2>
+        <p class="muted">Door, climate, food/water control (scaffolding).</p>
+      </div>
+    </div>
+
+    <div class="thermo-grid">
+      <div class="card thermo-panel">
+        <div class="section-header">
+          <h3>Door &amp; Safety</h3>
+        </div>
+        <div class="thermo-metric">
+          <div class="thermo-label">Door status</div>
+          <div class="thermo-value" id="dog-door-status">--</div>
+          <div class="thermo-sub">Last open: <span id="dog-door-open">--</span></div>
+          <div class="thermo-sub">Last close: <span id="dog-door-close">--</span></div>
+        </div>
+        <div class="thermo-meta">Emergency open thresholds (editable soon)</div>
+        <div class="thermo-sub">Actual > 200F → open</div>
+        <div class="thermo-sub">Real feel > 100F → open</div>
+      </div>
+
+      <div class="card thermo-panel">
+        <div class="section-header">
+          <h3>Climate</h3>
+        </div>
+        <div class="thermo-metric">
+          <div class="thermo-label">Inside</div>
+          <div class="thermo-value" id="dog-temp">--</div>
+          <div class="thermo-sub">Real feel: <span id="dog-feel">--</span></div>
+          <div class="thermo-sub">Humidity: <span id="dog-hum">--</span></div>
+        </div>
+        <div class="thermo-sub">Fan on &gt; 80F feel | Heater on &lt; 50F feel</div>
+        <div class="thermo-sub">Outside (WU): <span id="dog-outside">--</span></div>
+      </div>
+    </div>
+
+    <div class="thermo-grid">
+      <div class="card thermo-panel">
+        <div class="section-header">
+          <h3>Food &amp; Water</h3>
+        </div>
+        <div class="thermo-sub" id="dog-food-level">Food supply: --</div>
+        <div class="thermo-sub" id="dog-water-level">Water status: --</div>
+        <div class="thermo-sub" id="dog-feed-last">Last fed: --</div>
+        <div class="thermo-sub" id="dog-water-last">Last watered: --</div>
+        <div class="thermo-sub">Manual feed/water controls coming next.</div>
+      </div>
+
+      <div class="card thermo-panel">
+        <div class="section-header">
+          <h3>Camera</h3>
+        </div>
+        <div class="placeholder">
+          <p class="muted">Wyze cam integration placeholder.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="card thermo-panel">
+      <div class="section-header">
+        <h3>History (indoor)</h3>
+      </div>
+      <canvas id="doghouse-chart" width="900" height="280"></canvas>
+      <div class="thermo-history-legend">
+        <span><span class="thermo-swatch" style="background:#30d158"></span>Temp</span>
+        <span><span class="thermo-swatch" style="background:#ec4899"></span>Real feel</span>
+        <span><span class="thermo-swatch" style="background:#22c55e"></span>Humidity</span>
+      </div>
+    </div>
   `;
 }
 
@@ -339,12 +464,12 @@ function renderThermostat() {
         </div>
         <div class="propane-oval-row">
           <div class="propane-oval">
+            <div class="propane-lid"></div>
             <div class="propane-fill" id="propane-fill"></div>
           </div>
-          <span class="propane-oval-percent" id="propane-oval-percent">--%</span>
+          <div class="thermo-value" id="propane-percent">--</div>
         </div>
         <div class="propane-meta">
-          <div class="thermo-value" id="propane-percent">--</div>
           <div class="thermo-sub" id="propane-gallons">--</div>
           <div class="thermo-sub" id="propane-eta">--</div>
           <div class="thermo-sub" id="propane-cost">--</div>
@@ -415,13 +540,28 @@ function renderThermostat() {
       <div class="section-header">
         <h3>Outside history</h3>
       </div>
-      <div class="chart-hover" id="thermo-hover-outside">Hover to see values.</div>
-      <canvas id="thermo-chart-outside" width="900" height="280"></canvas>
+      <div class="chart-hover" id="outside-hover-temp">Hover to see values.</div>
+      <canvas id="outside-chart-temp" width="900" height="220"></canvas>
       <div class="thermo-history-legend">
         <span><span class="thermo-swatch" style="background:#a855f7"></span>Temp</span>
         <span><span class="thermo-swatch" style="background:#ec4899"></span>Feels</span>
-        <span><span class="thermo-swatch" style="background:#22c55e"></span>Humidity</span>
-        <span><span class="thermo-swatch" style="background:#0ea5e9"></span>Precip</span>
+      </div>
+      <div class="chart-hover" id="outside-hover-precip">Hover to see values.</div>
+      <canvas id="outside-chart-precip" width="900" height="180"></canvas>
+      <div class="thermo-history-legend">
+        <span><span class="thermo-swatch" style="background:#0ea5e9"></span>Precip (in/hr)</span>
+      </div>
+      <div class="chart-hover" id="outside-hover-wind">Hover to see values.</div>
+      <canvas id="outside-chart-wind" width="900" height="200"></canvas>
+      <div class="thermo-history-legend">
+        <span><span class="thermo-swatch" style="background:#22c55e"></span>Wind</span>
+        <span><span class="thermo-swatch" style="background:#f97316"></span>Gust</span>
+      </div>
+      <div class="chart-hover" id="outside-hover-pressure">Hover to see values.</div>
+      <canvas id="outside-chart-pressure" width="900" height="180"></canvas>
+      <div class="thermo-history-legend">
+        <span><span class="thermo-swatch" style="background:#94a3b8"></span>Pressure (inHg)</span>
+        <span><span class="thermo-swatch" style="background:#38bdf8"></span>Humidity</span>
       </div>
     </div>
   `;
@@ -952,7 +1092,7 @@ async function clearThermostatSchedule() {
 
 async function loadThermostatHistory(range) {
   const indoorCanvas = document.getElementById("thermo-chart-indoor");
-  const outsideCanvas = document.getElementById("thermo-chart-outside");
+  const outsideCanvas = document.getElementById("outside-chart-temp");
   if (!indoorCanvas && !outsideCanvas) return;
   const now = Date.now();
   let cutoff = 0;
@@ -988,10 +1128,12 @@ async function loadThermostatHistory(range) {
     state.thermostatHistory = points;
     const outsidePoints = await loadOutsideHistory(startDate, endDate);
     state.outsideHistory = outsidePoints;
-    drawThermostatCharts(points, outsidePoints, range);
+    drawThermostatCharts(points, [], range);
+    drawOutsideCharts(outsidePoints, range);
   } catch (err) {
     console.error("Thermostat history load error", err);
     drawThermostatCharts([], [], range);
+    drawOutsideCharts([], range);
   }
 }
 
@@ -1017,7 +1159,8 @@ async function loadOutsideHistory(startDate, endDate) {
         humidity: d.humidity != null ? Number(d.humidity) : null,
         windMph: d.windMph != null ? Number(d.windMph) : null,
         windGustMph: d.windGustMph != null ? Number(d.windGustMph) : null,
-        precipIn: d.precipIn != null ? Number(d.precipIn) : null
+        precipIn: d.precipIn != null ? Number(d.precipIn) : null,
+        pressureIn: d.pressureIn != null ? Number(d.pressureIn) : null
       });
     });
     return points;
@@ -1027,7 +1170,190 @@ async function loadOutsideHistory(startDate, endDate) {
   }
 }
 
-function drawThermostatCharts(points, outsidePoints, range) {
+function drawOutsideCharts(outsidePoints, range) {
+  const tempCanvas = document.getElementById("outside-chart-temp");
+  const precipCanvas = document.getElementById("outside-chart-precip");
+  const windCanvas = document.getElementById("outside-chart-wind");
+  const pressureCanvas = document.getElementById("outside-chart-pressure");
+  if (!tempCanvas && !precipCanvas && !windCanvas && !pressureCanvas) return;
+
+  const tempSeries = [
+    { label: "Temp", color: "#a855f7", points: outsidePoints.map((p) => ({ ts: p.ts.getTime(), value: p.tempF })) },
+    { label: "Feels", color: "#ec4899", points: outsidePoints.map((p) => ({ ts: p.ts.getTime(), value: p.feelsF })) }
+  ];
+  const precipSeries = [
+    { label: "Precip", color: "#0ea5e9", points: outsidePoints.map((p) => ({ ts: p.ts.getTime(), value: p.precipIn })) }
+  ];
+  const windSeries = [
+    { label: "Wind", color: "#22c55e", points: outsidePoints.map((p) => ({ ts: p.ts.getTime(), value: p.windMph })) },
+    { label: "Gust", color: "#f97316", points: outsidePoints.map((p) => ({ ts: p.ts.getTime(), value: p.windGustMph })) }
+  ];
+  const pressureSeries = [
+    { label: "Pressure", color: "#94a3b8", points: outsidePoints.map((p) => ({ ts: p.ts.getTime(), value: p.pressureIn })) },
+    { label: "Humidity", color: "#38bdf8", points: outsidePoints.map((p) => ({ ts: p.ts.getTime(), value: p.humidity })) }
+  ];
+
+  const charts = [];
+  if (tempCanvas) charts.push(drawSyncChart(tempCanvas, tempSeries, range, document.getElementById("outside-hover-temp")));
+  if (precipCanvas) charts.push(drawSyncChart(precipCanvas, precipSeries, range, document.getElementById("outside-hover-precip")));
+  if (windCanvas) charts.push(drawSyncChart(windCanvas, windSeries, range, document.getElementById("outside-hover-wind")));
+  if (pressureCanvas) charts.push(drawSyncChart(pressureCanvas, pressureSeries, range, document.getElementById("outside-hover-pressure")));
+
+  function syncAt(time) {
+    charts.forEach((c) => c && c.draw(time));
+  }
+  function clearSync() {
+    charts.forEach((c) => c && c.draw(null));
+  }
+
+  // Attach listeners to each chart to drive sync
+  charts.forEach((c) => {
+    if (!c) return;
+    c.canvas.onmousemove = (ev) => syncAt(c.timeFromEvent(ev));
+    c.canvas.onmouseleave = () => clearSync();
+    c.canvas.ontouchstart = (ev) => {
+      ev.preventDefault();
+      if (ev.touches?.[0]) syncAt(c.timeFromTouch(ev.touches[0]));
+    };
+    c.canvas.ontouchmove = (ev) => {
+      ev.preventDefault();
+      if (ev.touches?.[0]) syncAt(c.timeFromTouch(ev.touches[0]));
+    };
+    c.canvas.ontouchend = () => clearSync();
+  });
+}
+
+function drawSyncChart(canvas, series, range, hoverEl) {
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const cleaned = series
+    .map((s) => ({ ...s, points: (s.points || []).filter((p) => p.value != null).sort((a, b) => a.ts - b.ts) }))
+    .filter((s) => s.points.length);
+  const allPoints = cleaned.flatMap((s) => s.points);
+  if (!allPoints.length) {
+    ctx.fillStyle = "#94a3b8";
+    ctx.fillText("No data yet.", 20, 30);
+    if (hoverEl) hoverEl.textContent = "No data available.";
+    return {
+      canvas,
+      draw: () => {},
+      timeFromEvent: () => Date.now(),
+      timeFromTouch: () => Date.now()
+    };
+  }
+  const values = allPoints.map((p) => p.value);
+  const times = allPoints.map((p) => p.ts);
+  const minVal = Math.min(...values);
+  const maxVal = Math.max(...values);
+  const minTs = Math.min(...times);
+  const maxTs = Math.max(...times);
+  const pad = 30;
+  const h = canvas.height - 2 * pad;
+  const w = canvas.width - 2 * pad;
+  const y = (v) => {
+    if (maxVal === minVal) return canvas.height / 2;
+    return pad + h - ((v - minVal) / (maxVal - minVal)) * h;
+  };
+  const x = (t) => {
+    if (maxTs === minTs) return pad + w / 2;
+    return pad + ((t - minTs) / (maxTs - minTs)) * w;
+  };
+
+  const baseImage = (() => {
+    cleaned.forEach((seriesItem) => {
+      ctx.beginPath();
+      ctx.strokeStyle = seriesItem.color;
+      ctx.lineWidth = 2;
+      seriesItem.points.forEach((p, idx) => {
+        const px = x(p.ts);
+        const py = y(p.value);
+        if (idx === 0) ctx.moveTo(px, py);
+        else ctx.lineTo(px, py);
+      });
+      ctx.stroke();
+    });
+    ctx.strokeStyle = "#222a35";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(pad, canvas.height - pad);
+    ctx.lineTo(canvas.width - pad, canvas.height - pad);
+    ctx.stroke();
+    ctx.fillStyle = "#94a3b8";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "top";
+    const ticks = 5;
+    for (let i = 0; i < ticks; i++) {
+      const t = minTs + (i / (ticks - 1)) * (maxTs - minTs);
+      const px = x(t);
+      const label = range === "day"
+        ? new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+        : new Date(t).toLocaleDateString();
+      ctx.fillText(label, px, canvas.height - pad + 4);
+      ctx.beginPath();
+      ctx.moveTo(px, canvas.height - pad);
+      ctx.lineTo(px, canvas.height - pad - 4);
+      ctx.strokeStyle = "#444d5e";
+      ctx.stroke();
+    }
+    return ctx.getImageData(0, 0, canvas.width, canvas.height);
+  })();
+
+  const findNearest = (pts, target) => {
+    let best = null;
+    let bestDiff = Number.POSITIVE_INFINITY;
+    pts.forEach((p) => {
+      const diff = Math.abs(p.ts - target);
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        best = p;
+      }
+    });
+    return best;
+  };
+
+  function draw(time) {
+    ctx.putImageData(baseImage, 0, 0);
+    if (time == null) {
+      if (hoverEl) hoverEl.textContent = "Hover to see values.";
+      return;
+    }
+    const px = x(time);
+    ctx.strokeStyle = "#38bdf8";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(px, pad / 2);
+    ctx.lineTo(px, canvas.height - pad / 2);
+    ctx.stroke();
+
+    if (hoverEl) {
+      const timeLabel = range === "day"
+        ? new Date(time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+        : new Date(time).toLocaleString();
+      const parts = [];
+      cleaned.forEach((s) => {
+        const n = findNearest(s.points, time);
+        if (!n) return;
+        parts.push(`${s.label}: ${Number(n.value).toFixed(2)}`);
+      });
+      hoverEl.textContent = parts.length ? `${timeLabel} | ${parts.join("  ")}` : timeLabel;
+    }
+  }
+
+  function timeFromEvent(ev) {
+    const rect = canvas.getBoundingClientRect();
+    const pct = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
+    return minTs + pct * (maxTs - minTs);
+  }
+  function timeFromTouch(touch) {
+    const rect = canvas.getBoundingClientRect();
+    const pct = Math.max(0, Math.min(1, (touch.clientX - rect.left) / rect.width));
+    return minTs + pct * (maxTs - minTs);
+  }
+
+  draw(null);
+  return { canvas, draw, timeFromEvent, timeFromTouch };
+}
+function drawThermostatCharts(points, _outsidePoints, range) {
   const propane = state.propaneReadings || [];
   const propanePercents = propane.map((r) => Math.min(100, Math.max(0, (r.level / (r.capacity || DEFAULT_PROPANE_CAPACITY)) * 100)));
   const propaneSeries = propane.map((r, idx) => ({ ts: r.ts.getTime(), value: propanePercents[idx] }));
@@ -1038,14 +1364,6 @@ function drawThermostatCharts(points, outsidePoints, range) {
     { label: "Propane %", color: "#38bdf8", points: propaneSeries }
   ];
   drawLineChart("thermo-chart-indoor", indoorSeries, range, "thermo-hover-indoor");
-
-  const outsideSeries = [
-    { label: "Temp", color: "#a855f7", points: outsidePoints.map((p) => ({ ts: p.ts.getTime(), value: p.tempF })) },
-    { label: "Feels", color: "#ec4899", points: outsidePoints.map((p) => ({ ts: p.ts.getTime(), value: p.feelsF })) },
-    { label: "Humidity", color: "#22c55e", points: outsidePoints.map((p) => ({ ts: p.ts.getTime(), value: p.humidity })) },
-    { label: "Precip", color: "#0ea5e9", points: outsidePoints.map((p) => ({ ts: p.ts.getTime(), value: p.precipIn })) }
-  ];
-  drawLineChart("thermo-chart-outside", outsideSeries, range, "thermo-hover-outside");
 }
 
 function drawLineChart(canvasId, series, range, hoverId) {
@@ -1242,7 +1560,6 @@ function renderPropane(readings) {
   const etaEl = document.getElementById("propane-eta");
   const statsEl = document.getElementById("propane-stats");
   const fillEl = document.getElementById("propane-fill");
-  const ovalPct = document.getElementById("propane-oval-percent");
   const costEl = document.getElementById("propane-cost");
   const costInput = document.getElementById("propane-cost-input");
   const capInput = document.getElementById("propane-capacity-input");
@@ -1252,7 +1569,6 @@ function renderPropane(readings) {
     if (galEl) galEl.textContent = "--";
     if (etaEl) etaEl.textContent = "--";
     if (fillEl) fillEl.style.width = "0%";
-    if (ovalPct) ovalPct.textContent = "--%";
     if (costEl) costEl.textContent = "--";
     if (statsEl) statsEl.textContent = "No readings yet.";
     drawPropaneChart([]);
@@ -1272,7 +1588,6 @@ function renderPropane(readings) {
     fillEl.style.height = `${percent}%`;
     fillEl.style.background = propaneColor(percent);
   }
-  if (ovalPct) ovalPct.textContent = `${percent.toFixed(1)}%`;
   if (capInput && !capInput.value) capInput.value = String(capacity);
 
   const stats = computePropaneStats(readings);
@@ -1471,7 +1786,9 @@ function renderDog(deviceId, label = "Dog") {
   cleanupListeners();
   state.lastDeviceId = deviceId;
   state.selectedDay = startOfDay(new Date());
-  state.timelineCursorMin = minutesSinceMidnight(new Date());
+  state.timelineStartMin = 0;
+  state.timelineEndMin = 1440;
+  state.timelineHoverTs = null;
   state.historyWindowMinutes = DEFAULT_WINDOW_MINUTES;
   state.historyPoints = [];
   state.debug.deviceError = null;
@@ -1490,8 +1807,6 @@ function renderDog(deviceId, label = "Dog") {
       </div>
       <span class="pill online" id="dog-status"><span class="dot"></span>Online</span>
     </div>
-
-    <div id="map" class="map"></div>
 
     <div class="stats-grid">
       <div class="stat">
@@ -1541,6 +1856,15 @@ function renderDog(deviceId, label = "Dog") {
       </div>
     </div>
 
+    <div class="mode-row">
+      <div class="pill" id="net-pill"><span class="dot"></span>Net: -</div>
+      <div class="mode-actions">
+        <button class="btn" type="button" id="net-wifi-btn">Use Wi‑Fi</button>
+        <button class="btn ghost" type="button" id="net-cell-btn">Use Cellular</button>
+        <span class="muted" id="net-meta"></span>
+      </div>
+    </div>
+
     <div class="card config-card">
       <div class="section-header">
         <h3>Geofence config</h3>
@@ -1561,6 +1885,26 @@ function renderDog(deviceId, label = "Dog") {
       </div>
     </div>
 
+    <div class="card config-card">
+      <div class="section-header">
+        <h3>Geofence editor (polygon)</h3>
+        <p class="muted">Select geofence, draw on map, save to Firestore. Defaults used if empty.</p>
+      </div>
+      <div class="config-grid">
+        <label>Geofence
+          <select id="geofence-select">
+            ${GEOFENCE_NAMES.map((n) => `<option value="${n}">${n}</option>`).join("")}
+          </select>
+        </label>
+        <div class="config-actions">
+          <button class="btn ghost" type="button" id="geofence-draw-btn">Draw/Redraw</button>
+          <button class="btn ghost" type="button" id="geofence-clear-btn">Clear</button>
+          <button class="btn" type="button" id="geofence-save-btn">Save geofence</button>
+        </div>
+        <div class="muted" id="geofence-meta">No geofence loaded.</div>
+      </div>
+    </div>
+
     <div class="card">
       <div class="section-header">
         <h3>History</h3>
@@ -1570,21 +1914,35 @@ function renderDog(deviceId, label = "Dog") {
           <button class="btn ghost" type="button" id="day-next-btn">&rarr;</button>
         </div>
       </div>
-      <div class="timeline-row">
-        <label class="label">Timeline scrubber (minutes)
-          <input type="range" id="timeline-range" min="0" max="1440" step="1">
-        </label>
-        <div class="history-meta" id="timeline-label">Adjust scrubber to view track.</div>
-      </div>
       <div class="history-meta" id="history-meta">Loading history...</div>
+    </div>
+
+    <div class="card">
+      <div class="section-header">
+        <h3>Timeline (today)</h3>
+        <div class="history-meta" id="timeline-label">00:00 - 23:59</div>
+      </div>
+      <div class="timeline-container">
+        <canvas id="timeline-canvas" width="900" height="120"></canvas>
+        <div class="history-meta" id="timeline-hover">Hover to see time.</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="section-header">
+        <h3>Map</h3>
+      </div>
+      <div id="map" class="map"></div>
     </div>
     ${debugPanel}
   `;
 
   initMap();
   bindConfigHandlers(deviceId);
-  setupTimelineControls(deviceId);
+  setupGeofenceEditor(deviceId);
+  setupTimelineCanvas(deviceId);
   subscribeDevice(deviceId);
+  bindNetHandlers(deviceId);
   loadHistory(deviceId, state.selectedDay);
   state.historyTimer = setInterval(() => loadHistory(deviceId, state.selectedDay), 30000);
 
@@ -1606,38 +1964,231 @@ function bindConfigHandlers(deviceId) {
   }
 }
 
-function setupTimelineControls(deviceId) {
-  const range = document.getElementById("timeline-range");
+async function setupGeofenceEditor(deviceId) {
+  const select = document.getElementById("geofence-select");
+  const drawBtn = document.getElementById("geofence-draw-btn");
+  const clearBtn = document.getElementById("geofence-clear-btn");
+  const saveBtn = document.getElementById("geofence-save-btn");
+  const meta = document.getElementById("geofence-meta");
+  const canEdit = !!state.user;
+  if (select) select.value = state.selectedGeofence || "nearby";
+  [drawBtn, clearBtn, saveBtn, select].forEach((el) => {
+    if (!el) return;
+    if (el.tagName === "BUTTON") el.disabled = !canEdit;
+  });
+
+  await loadGeofences(deviceId);
+
+  if (select) {
+    select.onchange = () => {
+      state.selectedGeofence = select.value;
+      renderGeofencePolygon(select.value);
+    };
+  }
+  if (drawBtn) {
+    drawBtn.onclick = () => {
+      startDrawingGeofence();
+      if (meta) meta.textContent = "Click on map to draw polygon. Double-click to finish.";
+    };
+  }
+  if (clearBtn) {
+    clearBtn.onclick = () => {
+      clearGeofencePolygon(state.selectedGeofence);
+      if (meta) meta.textContent = "Cleared.";
+    };
+  }
+  if (saveBtn) {
+    saveBtn.onclick = () => saveGeofence(deviceId);
+  }
+}
+
+async function loadGeofences(deviceId) {
+  try {
+    const ref = doc(db, "devices", deviceId);
+    const snap = await getDoc(ref);
+    const data = snap.data();
+    state.geofencePolygons = (data?.geofences as Record<string, { polygon?: Array<{ lat: number; lng: number }> }>) || {};
+    renderGeofencePolygon(state.selectedGeofence || "nearby");
+  } catch (err) {
+    console.error("Failed to load geofences", err);
+  }
+}
+
+function renderGeofencePolygon(name) {
+  if (!state.map || !window.google?.maps) return;
+  const maps = window.google.maps;
+  // Clear existing
+  if (state.geofencePolygons[name]?.overlay) {
+    state.geofencePolygons[name].overlay.setMap(null);
+    delete state.geofencePolygons[name].overlay;
+  }
+  const poly = state.geofencePolygons[name];
+  if (!poly?.polygon || !poly.polygon.length) return;
+  const path = poly.polygon.map((p) => ({ lat: p.lat, lng: p.lng }));
+  const overlay = new maps.Polygon({
+    paths: path,
+    strokeColor: "#f59e0b",
+    strokeOpacity: 0.9,
+    strokeWeight: 2,
+    fillColor: "#f59e0b",
+    fillOpacity: 0.2
+  });
+  overlay.setMap(state.map);
+  state.geofencePolygons[name].overlay = overlay;
+}
+
+function startDrawingGeofence() {
+  if (!state.map || !window.google?.maps) return;
+  const maps = window.google.maps;
+  if (state.drawingManager) {
+    state.drawingManager.setMap(null);
+  }
+  state.drawingManager = new maps.drawing.DrawingManager({
+    drawingMode: maps.drawing.OverlayType.POLYGON,
+    drawingControl: false,
+    polygonOptions: {
+      strokeColor: "#22c55e",
+      strokeOpacity: 0.9,
+      strokeWeight: 2,
+      fillColor: "#22c55e",
+      fillOpacity: 0.2
+    }
+  });
+  state.drawingManager.setMap(state.map);
+  maps.event.addListener(state.drawingManager, "overlaycomplete", (e) => {
+    state.drawingManager?.setMap(null);
+    state.drawingManager = null;
+    const path = e.overlay.getPath().getArray().map((latlng) => ({ lat: latlng.lat(), lng: latlng.lng() }));
+    clearGeofencePolygon(state.selectedGeofence);
+    state.geofencePolygons[state.selectedGeofence] = { polygon: path, overlay: e.overlay };
+  });
+}
+
+function clearGeofencePolygon(name) {
+  const poly = state.geofencePolygons[name];
+  if (poly?.overlay) {
+    poly.overlay.setMap(null);
+  }
+  delete state.geofencePolygons[name];
+}
+
+async function saveGeofence(deviceId) {
+  if (!requireAuth("save geofence")) return;
+  const name = state.selectedGeofence || "nearby";
+  const poly = state.geofencePolygons[name];
+  const meta = document.getElementById("geofence-meta");
+  if (!poly?.polygon?.length) {
+    if (meta) meta.textContent = "Draw a polygon first.";
+    return;
+  }
+  try {
+    await setDoc(
+      doc(db, "devices", deviceId),
+      { geofences: { [name]: { polygon: poly.polygon, updatedAt: Timestamp.now() } } },
+      { merge: true }
+    );
+    if (meta) meta.textContent = `Saved geofence "${name}".`;
+  } catch (err) {
+    console.error("Save geofence failed", err);
+    if (meta) meta.textContent = "Error saving geofence.";
+  }
+}
+
+function setupTimelineCanvas(deviceId) {
+  const canvas = document.getElementById("timeline-canvas");
+  const hoverEl = document.getElementById("timeline-hover");
+  const labelEl = document.getElementById("timeline-label");
   const prevBtn = document.getElementById("day-prev-btn");
   const nextBtn = document.getElementById("day-next-btn");
 
   updateDayLabel();
-
-  if (range) {
-    range.value = state.timelineCursorMin;
-    range.oninput = (e) => {
-      state.timelineCursorMin = Number(e.target.value) || 0;
-      renderTimelineSlice();
-    };
-  }
-
   if (prevBtn) {
     prevBtn.onclick = () => {
       state.selectedDay = addDays(state.selectedDay, -1);
+      state.timelineStartMin = 0;
+      state.timelineEndMin = 1440;
       updateDayLabel();
+      if (labelEl) labelEl.textContent = `${formatMinutes(0)} - ${formatMinutes(1440)}`;
       loadHistory(deviceId, state.selectedDay);
     };
   }
-
   if (nextBtn) {
     nextBtn.onclick = () => {
       const maybeNext = addDays(state.selectedDay, 1);
       if (maybeNext > startOfDay(new Date())) return;
       state.selectedDay = maybeNext;
+      state.timelineStartMin = 0;
+      state.timelineEndMin = 1440;
       updateDayLabel();
+      if (labelEl) labelEl.textContent = `${formatMinutes(0)} - ${formatMinutes(1440)}`;
       loadHistory(deviceId, state.selectedDay);
     };
   }
+
+  if (!canvas) return;
+  let dragging = false;
+  let dragStart = 0;
+
+  const minuteFromEvent = (evt) => {
+    const rect = canvas.getBoundingClientRect();
+    const x = Math.min(Math.max(evt.clientX - rect.left, 0), rect.width);
+    return (x / rect.width) * 1440;
+  };
+
+  const updateHover = (minute) => {
+    const dayStart = startOfDay(state.selectedDay || new Date()).getTime();
+    const ts = new Date(dayStart + minute * 60000);
+    if (hoverEl) hoverEl.textContent = `Hover: ${formatTimeOfDay(ts)}`;
+    state.timelineHoverTs = ts.getTime();
+    highlightNearestPoint(ts.getTime());
+    drawTimeline(state.historyPoints);
+  };
+
+  canvas.onmousemove = (e) => {
+    const minute = minuteFromEvent(e);
+    if (!dragging) {
+      updateHover(minute);
+    } else {
+      state.timelineStartMin = Math.max(0, Math.min(1440, Math.min(dragStart, minute)));
+      state.timelineEndMin = Math.max(0, Math.min(1440, Math.max(dragStart, minute)));
+      if (labelEl) {
+        labelEl.textContent = `${formatMinutes(state.timelineStartMin)} - ${formatMinutes(state.timelineEndMin)}`;
+      }
+      drawTimeline(state.historyPoints);
+    }
+  };
+
+  canvas.onmouseleave = () => {
+    state.timelineHoverTs = null;
+    if (hoverEl) hoverEl.textContent = "Hover to see time.";
+    drawTimeline(state.historyPoints);
+  };
+
+  canvas.onmousedown = (e) => {
+    dragging = true;
+    dragStart = minuteFromEvent(e);
+    state.timelineStartMin = dragStart;
+    state.timelineEndMin = dragStart;
+  };
+
+  if (state.timelineMouseUpHandler) {
+    window.removeEventListener("mouseup", state.timelineMouseUpHandler);
+  }
+
+  state.timelineMouseUpHandler = (e) => {
+    if (!dragging) return;
+    dragging = false;
+    const minute = minuteFromEvent(e);
+    state.timelineStartMin = Math.max(0, Math.min(1440, Math.min(dragStart, minute)));
+    state.timelineEndMin = Math.max(0, Math.min(1440, Math.max(dragStart, minute)));
+    if (labelEl) {
+      labelEl.textContent = `${formatMinutes(state.timelineStartMin)} - ${formatMinutes(state.timelineEndMin)}`;
+    }
+    renderTimelineSlice();
+    drawTimeline(state.historyPoints);
+  };
+
+  window.addEventListener("mouseup", state.timelineMouseUpHandler);
 }
 
 function subscribeDevice(deviceId) {
@@ -1693,7 +2244,8 @@ async function loadHistory(deviceId, day = state.selectedDay || startOfDay(new D
         points.push({
           lat: Number(d.lat),
           lon: Number(d.lon),
-          ts: tsDate
+          ts: tsDate,
+          speedMph: d.speedMph != null ? Number(d.speedMph) : undefined
         });
       }
     });
@@ -1712,51 +2264,104 @@ async function loadHistory(deviceId, day = state.selectedDay || startOfDay(new D
 
 function renderTimelineSlice() {
   const labelEl = document.getElementById("timeline-label");
-  const range = document.getElementById("timeline-range");
-  if (range && range.value !== String(state.timelineCursorMin)) {
-    range.value = state.timelineCursorMin;
-  }
+  const startMin = Math.max(0, Math.min(1440, state.timelineStartMin ?? 0));
+  const endMin = Math.max(startMin, Math.min(1440, state.timelineEndMin ?? 1440));
 
-  const slice = filterPointsForWindow(
-    state.historyPoints,
-    state.selectedDay,
-    state.timelineCursorMin,
-    state.historyWindowMinutes
-  );
+  const slice = filterPointsForRange(state.historyPoints, state.selectedDay, startMin, endMin);
   const reduced = downsamplePoints(slice, HISTORY_RENDER_LIMIT);
   drawHistory(reduced);
 
-  const dayStart = startOfDay(state.selectedDay || new Date());
-  const cursorDate = new Date(dayStart.getTime() + state.timelineCursorMin * 60000);
-
-  if (labelEl) {
-    labelEl.textContent = slice.length
-      ? `Showing ${state.historyWindowMinutes} min ending ${formatTimeOfDay(cursorDate)} (${slice.length} / ${state.historyPoints.length})`
-      : `No points in last ${state.historyWindowMinutes} min before ${formatTimeOfDay(cursorDate)}`;
-  }
-
-  const histMeta = document.getElementById("history-meta");
-  if (histMeta && state.historyPoints.length && slice.length === 0) {
-    const dayLabel = formatDayLabel(state.selectedDay);
-    histMeta.textContent = `No points in selected window on ${dayLabel}.`;
-  }
+  if (labelEl) labelEl.textContent = `${formatMinutes(startMin)} - ${formatMinutes(endMin)}`;
 
   return slice;
+}
+
+function drawTimeline(points) {
+  const canvas = document.getElementById("timeline-canvas");
+  const hoverEl = document.getElementById("timeline-hover");
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  const w = canvas.clientWidth || canvas.width;
+  const h = canvas.height;
+  if (canvas.width !== w) canvas.width = w;
+  ctx.clearRect(0, 0, w, h);
+
+  // background
+  ctx.fillStyle = "rgba(255,255,255,0.02)";
+  ctx.fillRect(0, 0, w, h);
+
+  const startMin = Math.max(0, Math.min(1440, state.timelineStartMin ?? 0));
+  const endMin = Math.max(startMin, Math.min(1440, state.timelineEndMin ?? 1440));
+
+  // selection window
+  ctx.fillStyle = "rgba(46, 204, 250, 0.12)";
+  const selX1 = (startMin / 1440) * w;
+  const selX2 = (endMin / 1440) * w;
+  ctx.fillRect(selX1, 0, selX2 - selX1, h);
+
+  // timeline baseline
+  ctx.strokeStyle = "rgba(148, 163, 184, 0.6)";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(0, h - 20);
+  ctx.lineTo(w, h - 20);
+  ctx.stroke();
+
+  if (points?.length) {
+    ctx.strokeStyle = "#22d3ee";
+    ctx.lineWidth = 2;
+    points.forEach((p) => {
+      const ts = p.ts?.getTime?.();
+      if (!ts) return;
+      const minutes = minutesSinceMidnight(p.ts);
+      const x = (minutes / 1440) * w;
+      ctx.beginPath();
+      ctx.moveTo(x, h - 24);
+      ctx.lineTo(x, h - 4);
+      ctx.stroke();
+    });
+  }
+
+  if (state.timelineHoverTs) {
+    const minutes = minutesSinceMidnight(new Date(state.timelineHoverTs));
+    const x = (minutes / 1440) * w;
+    ctx.strokeStyle = "#f97316";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, h);
+    ctx.stroke();
+    if (hoverEl) hoverEl.textContent = `Hover: ${formatMinutes(minutes)}`;
+  }
 }
 
 function initMap() {
   const mapEl = document.getElementById("map");
   if (!mapEl) return;
 
-  if (state.map) {
-    state.map.remove();
-    state.map = null;
-  }
+  if (state.marker?.setMap) state.marker.setMap(null);
+  if (state.polyline?.setMap) state.polyline.setMap(null);
+  state.marker = null;
+  state.polyline = null;
+  state.map = null;
 
-  state.map = L.map(mapEl).setView([0, 0], 2);
-  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-    attribution: "OpenStreetMap contributors"
-  }).addTo(state.map);
+  loadGoogleMaps().then((maps) => {
+    if (!maps || !mapEl) {
+      mapEl.innerHTML = `<div class="muted">Google Maps API key missing.</div>`;
+      return;
+    }
+    state.map = new maps.Map(mapEl, {
+      center: { lat: 0, lng: 0 },
+      zoom: 2,
+      mapTypeControl: false,
+      streetViewControl: false,
+      fullscreenControl: false,
+      zoomControl: true
+    });
+    if (state.lastDeviceId && state.lastSnapshot) {
+      updateDogUI(state.lastDeviceId, state.lastSnapshot);
+    }
+  });
 }
 
 function updateDogUI(deviceId, data) {
@@ -1772,6 +2377,8 @@ function updateDogUI(deviceId, data) {
   const pingEl = document.getElementById("stat-ping");
   const netEl = document.getElementById("stat-net");
   const usageEl = document.getElementById("stat-usage");
+  const netPill = document.getElementById("net-pill");
+  const netMeta = document.getElementById("net-meta");
 
   if (!title) return;
 
@@ -1804,20 +2411,42 @@ function updateDogUI(deviceId, data) {
   if (netEl) netEl.textContent = netKind;
   if (usageEl) usageEl.textContent = formatDataUsage(data?.counters?.monthBytes);
 
+  const desiredNet = (state.pendingNet?.target || config?.preferredNet || "auto").toLowerCase();
+  const actualNet = (netKind || "").toLowerCase();
+  const isSwitching = !!state.pendingNet && state.pendingNet.target === desiredNet && actualNet !== desiredNet;
+
+  if (netPill) {
+    const pillClass = isSwitching ? "pill stale" : actualNet ? "pill online" : "pill offline";
+    netPill.className = pillClass;
+    netPill.innerHTML = `<span class="dot"></span>Net: ${netKind || "-"}`;
+  }
+  if (netMeta) {
+    if (isSwitching) {
+      netMeta.textContent = `Switching to ${desiredNet}...`;
+    } else {
+      netMeta.textContent = `Preferred: ${desiredNet}`;
+    }
+  }
+  if (state.pendingNet && actualNet === state.pendingNet.target) {
+    state.pendingNet = null;
+  }
+
   updateModeUI(deviceId, data, config);
   updateConfigUI(config, last);
 
   const lat = Number(last?.lat);
   const lon = Number(last?.lon);
-  if (state.map && !Number.isNaN(lat) && !Number.isNaN(lon)) {
-    const pos = [lat, lon];
+  if (state.map && window.google?.maps && !Number.isNaN(lat) && !Number.isNaN(lon)) {
+    const pos = { lat, lng: lon };
+    const maps = window.google.maps;
     if (!state.marker) {
-      state.marker = L.marker(pos).addTo(state.map);
+      state.marker = new maps.Marker({ position: pos, map: state.map });
     } else {
-      state.marker.setLatLng(pos);
+      state.marker.setPosition(pos);
     }
     if (!state.polyline) {
-      state.map.setView(pos, 15);
+      state.map.setCenter(pos);
+      state.map.setZoom(15);
     }
   }
 
@@ -1892,6 +2521,40 @@ async function clearForceRoaming(deviceId) {
   } catch (err) {
     console.error("Clear force roaming failed", err);
     if (meta) meta.textContent = `Force roaming error: ${err.message}`;
+  }
+}
+
+function bindNetHandlers(deviceId) {
+  const wifiBtn = document.getElementById("net-wifi-btn");
+  const cellBtn = document.getElementById("net-cell-btn");
+  const meta = document.getElementById("net-meta");
+  const canEdit = !!state.user;
+  [wifiBtn, cellBtn].forEach((btn) => {
+    if (!btn) return;
+    btn.disabled = !canEdit;
+    btn.title = canEdit ? "" : "Sign in required.";
+  });
+  if (wifiBtn) wifiBtn.onclick = () => requestNetwork(deviceId, "wifi");
+  if (cellBtn) cellBtn.onclick = () => requestNetwork(deviceId, "cell");
+  if (!canEdit && meta) meta.textContent = "Sign in to change network.";
+}
+
+async function requestNetwork(deviceId, target) {
+  if (!requireAuth("set network")) return;
+  const meta = document.getElementById("net-meta");
+  state.pendingNet = { target };
+  if (meta) meta.textContent = `Requesting ${target}...`;
+  try {
+    await setDoc(
+      doc(db, "devices", deviceId),
+      { config: { preferredNet: target, requestedNetAt: Timestamp.now() } },
+      { merge: true }
+    );
+    if (meta) meta.textContent = `Requested ${target}. Waiting for device...`;
+  } catch (err) {
+    console.error("Network request failed", err);
+    if (meta) meta.textContent = `Network request error: ${err.message}`;
+    state.pendingNet = null;
   }
 }
 
@@ -1997,21 +2660,87 @@ function updateConfigUI(config, last) {
 }
 
 function drawHistory(points) {
-  if (!state.map) return;
-  if (state.polyline) {
-    state.polyline.remove();
+  if (!state.map || !window.google?.maps) return;
+  if (state.polyline?.setMap) {
+    state.polyline.setMap(null);
     state.polyline = null;
   }
+  state.historyMarkers?.forEach((m) => m?.setMap && m.setMap(null));
+  state.historyMarkers = [];
   if (!points.length) return;
 
-  const latlngs = points.map((p) => [p.lat, p.lon]);
-  state.polyline = L.polyline(latlngs, {
-    color: "#22d3ee",
-    weight: 4,
-    opacity: 0.8
-  }).addTo(state.map);
+  const path = points.map((p) => ({ lat: p.lat, lng: p.lon }));
+  const maps = window.google.maps;
+  state.polyline = new maps.Polyline({
+    path,
+    strokeColor: "#22d3ee",
+    strokeOpacity: 0.8,
+    strokeWeight: 4,
+    map: state.map
+  });
+  const bounds = new maps.LatLngBounds();
+  path.forEach((pt) => bounds.extend(pt));
+  state.map.fitBounds(bounds, 30);
 
-  state.map.fitBounds(state.polyline.getBounds(), { padding: [30, 30] });
+  if (!state.mapInfoWindow) state.mapInfoWindow = new maps.InfoWindow();
+
+  points.forEach((p) => {
+    const marker = new maps.Marker({
+      position: { lat: p.lat, lng: p.lon },
+      map: state.map,
+      icon: {
+        path: maps.SymbolPath.CIRCLE,
+        scale: 4,
+        fillColor: "#22d3ee",
+        fillOpacity: 0.9,
+        strokeColor: "#0ea5e9",
+        strokeWeight: 1
+      },
+      title: `${formatTimeOfDay(p.ts)}`
+    });
+    marker.addListener("mouseover", () => {
+      const speed = p.speedMph != null ? `${Number(p.speedMph).toFixed(1)} mph` : "-";
+      state.mapInfoWindow.setContent(`${formatTimeOfDay(p.ts)}<br/>Speed: ${speed}`);
+      state.mapInfoWindow.open({ map: state.map, anchor: marker });
+    });
+    state.historyMarkers.push(marker);
+  });
+}
+
+function highlightNearestPoint(tsMs) {
+  if (!state.map || !window.google?.maps || !state.historyPoints?.length || tsMs == null) return;
+  let best = null;
+  let bestDiff = Number.MAX_SAFE_INTEGER;
+  state.historyPoints.forEach((p) => {
+    const ts = p.ts?.getTime?.();
+    if (ts == null) return;
+    const diff = Math.abs(ts - tsMs);
+    if (diff < bestDiff) {
+      best = p;
+      bestDiff = diff;
+    }
+  });
+  if (!best) return;
+
+  const maps = window.google.maps;
+  if (!state.hoverMarker) {
+    state.hoverMarker = new maps.Marker({
+      map: state.map,
+      icon: {
+        path: maps.SymbolPath.CIRCLE,
+        scale: 6,
+        fillColor: "#f97316",
+        fillOpacity: 0.9,
+        strokeColor: "#fb923c",
+        strokeWeight: 1.5
+      }
+    });
+  }
+  state.hoverMarker.setPosition({ lat: best.lat, lng: best.lon });
+  const speed = best.speedMph != null ? `${Number(best.speedMph).toFixed(1)} mph` : "-";
+  if (!state.mapInfoWindow) state.mapInfoWindow = new maps.InfoWindow();
+  state.mapInfoWindow.setContent(`${formatTimeOfDay(best.ts)}<br/>Speed: ${speed}`);
+  state.mapInfoWindow.open({ map: state.map, anchor: state.hoverMarker });
 }
 
 function computeStatus(data) {
@@ -2082,14 +2811,14 @@ function withConfigDefaults(config, last) {
   };
 }
 
-function filterPointsForWindow(points, day, cursorMinutes, windowMinutes) {
+function filterPointsForRange(points, day, startMinutes, endMinutes) {
   if (!points?.length) return [];
   const dayStart = startOfDay(day || new Date()).getTime();
-  const cursor = dayStart + cursorMinutes * 60000;
-  const windowStart = cursor - windowMinutes * 60000;
+  const rangeStart = dayStart + startMinutes * 60000;
+  const rangeEnd = dayStart + endMinutes * 60000;
   return points.filter((p) => {
     const ts = p.ts?.getTime?.();
-    return ts != null && ts >= windowStart && ts <= cursor;
+    return ts != null && ts >= rangeStart && ts <= rangeEnd;
   });
 }
 
@@ -2138,6 +2867,17 @@ function formatTimeOfDay(date) {
     hour: "2-digit",
     minute: "2-digit"
   }).format(date);
+}
+
+function formatMinutes(min) {
+  const clamped = Math.max(0, Math.min(1439, Math.floor(min)));
+  const hours = Math.floor(clamped / 60)
+    .toString()
+    .padStart(2, "0");
+  const minutes = Math.floor(clamped % 60)
+    .toString()
+    .padStart(2, "0");
+  return `${hours}:${minutes}`;
 }
 
 function formatAge(date) {
@@ -2233,15 +2973,25 @@ function cleanupListeners() {
     state.propaneUnsub();
     state.propaneUnsub = null;
   }
-  if (state.map) {
-    state.map.remove();
-    state.map = null;
+  if (state.timelineMouseUpHandler) {
+    window.removeEventListener("mouseup", state.timelineMouseUpHandler);
+    state.timelineMouseUpHandler = null;
   }
+  if (state.marker?.setMap) state.marker.setMap(null);
+  if (state.polyline?.setMap) state.polyline.setMap(null);
+  if (state.hoverMarker?.setMap) state.hoverMarker.setMap(null);
+  state.historyMarkers?.forEach((m) => m?.setMap && m.setMap(null));
+  state.map = null;
   state.marker = null;
   state.polyline = null;
+  state.hoverMarker = null;
+  state.historyMarkers = [];
+  state.mapInfoWindow = null;
   state.historyPoints = [];
   state.selectedDay = startOfDay(new Date());
-  state.timelineCursorMin = minutesSinceMidnight(new Date());
+  state.timelineStartMin = 0;
+  state.timelineEndMin = 1440;
+  state.timelineHoverTs = null;
   state.currentConfig = null;
   state.lastSnapshot = null;
   state.thermostat = null;

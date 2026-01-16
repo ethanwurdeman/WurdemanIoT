@@ -54,6 +54,14 @@ Single place to see/change secrets, defaults, and paths. Keep this file updated 
 - Firmware source: device/water-dispenser/src/main.cpp
 - PlatformIO config: device/water-dispenser/platformio.ini
 
+## Dog House (ESP32, new)
+- Firestore layout (planned): doghouse/main (state/config), doghouse/main/history/*, doghouse/main/food/*, doghouse/main/water/*
+- Token: DOGHOUSE_DEVICE_TOKEN (config/firmware_secrets.h) must match Cloud Run env DOGHOUSE_TOKEN (non-secret, long token)
+- Safety defaults: door open + fan off if temp > 200 F; door open if real feel > 100 F; fan on if real feel > 80 F; heater on if real feel < 50 F
+- Outside data: reuse WU KNEBAYAR10 already ingested for thermostat
+- UI route: #/doghouse (linked from Pets)
+- Camera: placeholder for Wyze cam integration later
+
 ## Defaults (app / devices)
 - Thermostat setpoint/diff defaults: 70 F / 1.0 F (see thermostat firmware)
 - Thermostat schedule: empty by default (manual)
@@ -63,8 +71,9 @@ Single place to see/change secrets, defaults, and paths. Keep this file updated 
 - Thermostat: device/thermostat (PlatformIO: pio run -t upload)
 - Tyee: device/tyee (add source; then PlatformIO build/upload)
 - Water Dispenser: device/water-dispenser (PlatformIO: pio run -t upload)
+- Dog House: device/doghouse (to be added; ESP32 DevKit)
 
 ## Notes
 - Keep this file updated when tokens/keys/SSIDs change.
-- Functions env vars must match device tokens (TYEE_TOKEN for Tyee tracker, THERMOSTAT_TOKEN for thermostat).
+- Functions env vars must match device tokens (TYEE_TOKEN for Tyee tracker, THERMOSTAT_TOKEN for thermostat, DOGHOUSE_TOKEN for doghouse).
 - Shared firmware secrets live in config/firmware_secrets.h.

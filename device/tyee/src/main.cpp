@@ -1,0 +1,1036 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <cstdio>
+#include <ctime>
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+#define XPOWERS_CHIP_AXP2101
+#include <XPowersLib.h>
+
+#include "config.h"
+#ifdef USE_FIRMWARE_SECRETS
+#include "../../config/firmware_secrets.h"
+#endif
+
+#define SerialMon Serial
+#define SerialAT Serial1
+
+#define TINY_GSM_MODEM_SIM7080
+#include <TinyGsmClient.h>
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+
+#ifndef WIFI_SSID
+#define WIFI_SSID "Wurdeman Starlink 2.4"
+#endif
+#ifndef WIFI_PASSWORD
+#define WIFI_PASSWORD "Koda2020"
+#endif
+
+#ifndef APN
+#define APN "hologram"
+#endif
+
+#define ANSI_GREEN "\x1b[32m"
+#define ANSI_CYAN "\x1b[36m"
+#define ANSI_RESET "\x1b[0m"
+
+#if ENABLE_AT_DEBUG
+#include <StreamDebugger.h>
+StreamDebugger debugger(SerialAT, SerialMon);
+TinyGsm modem(debugger);
+#else
+TinyGsm modem(SerialAT);
+#endif
+
+TinyGsmClient netClient(modem, 0);
+TinyGsmClientSecure tlsClient(modem, 0);
+XPowersPMU pmu;
+
+struct FixPayload
+{
+    bool hasFix = false;
+    float lat = 0;
+    float lon = 0;
+    float hdop = 0;
+    int sats = 0;
+    uint64_t tsMs = 0;
+};
+
+static FixPayload lastFix;
+static uint64_t cellTxBytes = 0;
+static uint64_t cellRxBytes = 0;
+static double cellCost = 0.0;
+static unsigned long nextGnssAt = 0;
+static bool wifiPreferred = true;
+static bool radioReady = false;
+
+enum class TrackerMode
+{
+    Home,
+    Nearby,
+    Roaming
+};
+
+static TrackerMode currentMode = TrackerMode::Home;
+
+enum class LedState
+{
+    Searching,
+    Registered,
+    Fail
+};
+
+// Home base geofence (degrees) and radii (meters)
+constexpr double HOME_LAT = 41.74570242514908;
+constexpr double HOME_LON = -103.36769502711984;
+constexpr double HOME_RADIUS_M = 76.2;    // 250 ft
+constexpr double NEARBY_RADIUS_M = 228.6; // 750 ft
+
+// Cadence per mode
+constexpr uint32_t HOME_INTERVAL_MS = 5UL * 60UL * 1000UL;
+constexpr uint32_t NEARBY_INTERVAL_MS = 2UL * 60UL * 1000UL;
+constexpr uint32_t ROAM_INTERVAL_MS = 15UL * 1000UL;
+
+constexpr double CELL_COST_PER_MB = 0.03; // USD/MB
+
+int readBatteryPercent()
+{
+    if (!pmu.isBatteryConnect())
+    {
+        return -1;
+    }
+    return pmu.getBatteryPercent();
+}
+
+bool readChargingStatus()
+{
+    return pmu.isCharging();
+}
+
+void printModeHeader(const char *label, const char *color)
+{
+    SerialMon.print(color);
+    SerialMon.print("\n=== ");
+    SerialMon.print(label);
+    SerialMon.println(" ===");
+    SerialMon.print(ANSI_RESET);
+}
+
+void setLed(LedState state)
+{
+    switch (state)
+    {
+    case LedState::Searching:
+        pmu.setChargingLedMode(XPOWERS_CHG_LED_BLINK_1HZ);
+        break;
+    case LedState::Registered:
+        pmu.setChargingLedMode(XPOWERS_CHG_LED_ON);
+        break;
+    case LedState::Fail:
+        pmu.setChargingLedMode(XPOWERS_CHG_LED_BLINK_4HZ);
+        break;
+    }
+}
+
+time_t portableTimegm(struct tm *t)
+{
+#if defined(_WIN32)
+    return _mkgmtime(t);
+#else
+    time_t local = mktime(t);
+    if (local == static_cast<time_t>(-1))
+    {
+        return static_cast<time_t>(-1);
+    }
+    struct tm *gt = gmtime(&local);
+    if (!gt)
+    {
+        return static_cast<time_t>(-1);
+    }
+    time_t utc = mktime(gt);
+    if (utc == static_cast<time_t>(-1))
+    {
+        return static_cast<time_t>(-1);
+    }
+    double offset = difftime(local, utc);
+    return local + static_cast<time_t>(offset);
+#endif
+}
+
+uint64_t toEpochMs(int year, int month, int day, int hour, int minute, int second)
+{
+    if (year < 1970 || month < 1 || day < 1)
+    {
+        return millis();
+    }
+    struct tm t = {};
+    t.tm_year = year - 1900;
+    t.tm_mon = month - 1;
+    t.tm_mday = day;
+    t.tm_hour = hour;
+    t.tm_min = minute;
+    t.tm_sec = second;
+    time_t ts = portableTimegm(&t);
+    if (ts < 0)
+    {
+        return millis();
+    }
+    return static_cast<uint64_t>(ts) * 1000ULL;
+}
+
+double distanceMeters(double lat1, double lon1, double lat2, double lon2)
+{
+    constexpr double kEarthRadiusM = 6371000.0;
+    auto toRad = [](double deg) { return deg * M_PI / 180.0; };
+    double dLat = toRad(lat2 - lat1);
+    double dLon = toRad(lon2 - lon1);
+    double a = sin(dLat / 2) * sin(dLat / 2) +
+               cos(toRad(lat1)) * cos(toRad(lat2)) * sin(dLon / 2) * sin(dLon / 2);
+    double c = 2 * atan2(sqrt(a), sqrt(1 - a));
+    return kEarthRadiusM * c;
+}
+
+bool sendIngestWiFi()
+{
+    if (!lastFix.hasFix) return false;
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    const char *host = "us-central1-wurdemaniot.cloudfunctions.net";
+    const uint16_t port = 443;
+    const char *path = "/tyee_ingest";
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    if (!client.connect(host, port))
+    {
+        SerialMon.println("WiFi HTTPS connect failed.");
+        return false;
+    }
+
+    const int battPct = readBatteryPercent();
+    const bool charging = readChargingStatus();
+    String body;
+    body.reserve(256);
+    body += "{";
+    body += "\"deviceId\":\"Tyee\",";
+    body += "\"name\":\"Tyee\",";
+    body += "\"type\":\"pet\",";
+    body += "\"lat\":";
+    body += String(lastFix.lat, 6);
+    body += ",\"lon\":";
+    body += String(lastFix.lon, 6);
+    body += ",\"ts\":";
+    body += String(lastFix.tsMs);
+    body += ",\"battery\":";
+    body += (battPct >= 0 ? String(battPct) : "null");
+    body += ",\"charging\":";
+    body += (charging ? "true" : "false");
+    body += ",\"network\":\"wifi\"";
+    body += ",\"sats\":";
+    body += String(lastFix.sats);
+    body += ",\"hdop\":";
+    body += String(lastFix.hdop, 2);
+    body += ",\"enabled\":true}";
+
+    String headers;
+    headers.reserve(200);
+    headers += "POST ";
+    headers += path;
+    headers += " HTTP/1.1\r\nHost: ";
+    headers += host;
+    headers += "\r\nContent-Type: application/json\r\nContent-Length: ";
+    headers += body.length();
+    headers += "\r\nX-Device-Id: " DEVICE_ID;
+    headers += "\r\nX-Device-Token: " DEVICE_TOKEN;
+    headers += "\r\nConnection: close\r\n\r\n";
+
+    client.print(headers);
+    client.print(body);
+
+    bool ok = false;
+    String status;
+    unsigned long start = millis();
+    while (millis() - start < 10000UL)
+    {
+        while (client.available())
+        {
+            char c = client.read();
+            if (c == '\n')
+            {
+                if (status.startsWith("HTTP/1.1 200") || status.startsWith("HTTP/1.0 200") ||
+                    status.startsWith("HTTP/1.1 204") || status.startsWith("HTTP/1.0 204"))
+                {
+                    ok = true;
+                }
+                start = millis();
+            }
+            else if (c != '\r')
+            {
+                status += c;
+            }
+        }
+        if (!client.connected()) break;
+        delay(5);
+    }
+    client.stop();
+    SerialMon.printf("WiFi HTTP status: %s\n", status.c_str());
+    return ok;
+}
+
+bool sendIngestIfReady()
+{
+    if (!lastFix.hasFix)
+    {
+        SerialMon.println("No GNSS fix available to send.");
+        return false;
+    }
+
+    const char *host = "us-central1-wurdemaniot.cloudfunctions.net";
+    const uint16_t port = 443;
+    const char *path = "/tyee_ingest";
+
+    if (!tlsClient.connect(host, port))
+    {
+        SerialMon.println("TLS connect failed.");
+        return false;
+    }
+    SerialMon.println("TLS connect ok");
+
+    const int battPct = readBatteryPercent();
+    const bool charging = readChargingStatus();
+
+    auto makeBody = [&](size_t txBytesVal) {
+        String body;
+        body.reserve(256);
+        body += "{";
+        body += "\"deviceId\":\"Tyee\",";
+        body += "\"name\":\"Tyee\",";
+        body += "\"type\":\"pet\",";
+        body += "\"lat\":";
+        body += String(lastFix.lat, 6);
+        body += ",\"lon\":";
+        body += String(lastFix.lon, 6);
+        body += ",\"ts\":";
+        body += String(lastFix.tsMs);
+        body += ",\"battery\":";
+        body += (battPct >= 0 ? String(battPct) : "null");
+        body += ",\"charging\":";
+        body += (charging ? "true" : "false");
+        body += ",\"network\":\"";
+        body += "cell";
+        body += "\"";
+        body += ",\"txBytes\":";
+        body += String(txBytesVal);
+        body += ",\"rxBytes\":null";
+        body += ",\"sats\":";
+        body += String(lastFix.sats);
+        body += ",\"hdop\":";
+        body += String(lastFix.hdop, 2);
+        body += ",\"cellCost\":";
+        body += String(cellCost, 4);
+        body += ",\"enabled\":true}";
+        return body;
+    };
+
+    auto makeHeaders = [&](size_t contentLength) {
+        String headers;
+        headers.reserve(256);
+        headers += "POST ";
+        headers += path;
+        headers += " HTTP/1.1\r\n";
+        headers += "Host: ";
+        headers += host;
+        headers += "\r\nContent-Type: application/json\r\n";
+        headers += "Content-Length: ";
+        headers += contentLength;
+        headers += "\r\nX-Device-Id: " DEVICE_ID;
+        headers += "\r\nX-Device-Token: " DEVICE_TOKEN;
+        headers += "\r\nConnection: close\r\n\r\n";
+        return headers;
+    };
+
+    String body = makeBody(0);
+    String headers = makeHeaders(body.length());
+    size_t txLen = headers.length() + body.length();
+    body = makeBody(txLen);
+    headers = makeHeaders(body.length());
+    txLen = headers.length() + body.length();
+
+    tlsClient.print(headers);
+    tlsClient.print(body);
+
+    bool ok = false;
+    String status;
+    size_t rxLen = 0;
+    unsigned long start = millis();
+    while (millis() - start < 10000UL)
+    {
+        while (tlsClient.available())
+        {
+            char c = tlsClient.read();
+            rxLen++;
+            if (c == '\n')
+            {
+                if (status.startsWith("HTTP/1.1 200") || status.startsWith("HTTP/1.0 200") ||
+                    status.startsWith("HTTP/1.1 204") || status.startsWith("HTTP/1.0 204"))
+                {
+                    ok = true;
+                }
+                start = millis();
+            }
+            else if (c != '\r')
+            {
+                status += c;
+            }
+        }
+        if (!tlsClient.connected())
+        {
+            break;
+        }
+        delay(10);
+    }
+    tlsClient.stop();
+
+    SerialMon.printf("HTTP status: %s\n", status.c_str());
+
+    cellTxBytes += txLen;
+    cellRxBytes += rxLen;
+    cellCost = ((double)(cellTxBytes + cellRxBytes) / 1000000.0) * CELL_COST_PER_MB;
+    SerialMon.printf("Cellular usage this send: tx=%u rx=%u bytes (total tx=%llu rx=%llu) cost $%.4f\n",
+                     static_cast<unsigned>(txLen),
+                     static_cast<unsigned>(rxLen),
+                     static_cast<unsigned long long>(cellTxBytes),
+                     static_cast<unsigned long long>(cellRxBytes),
+                     cellCost);
+
+    return ok;
+}
+
+void printPins()
+{
+    SerialMon.println("Board: LilyGO T-SIM7080G S3");
+    SerialMon.println("Pin map:");
+    SerialMon.printf("  MODEM RXD: %d\n", MODEM_SERIAL_RX);
+    SerialMon.printf("  MODEM TXD: %d\n", MODEM_SERIAL_TX);
+    SerialMon.printf("  MODEM PWR: %d\n", MODEM_PWRKEY_PIN);
+    SerialMon.printf("  I2C SDA  : %d\n", I2C_SDA_PIN);
+    SerialMon.printf("  I2C SCL  : %d\n", I2C_SCL_PIN);
+}
+
+void logHint(const char *msg)
+{
+    SerialMon.println(msg);
+}
+
+bool initPMU()
+{
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+    if (!pmu.begin(Wire, AXP2101_SLAVE_ADDRESS, I2C_SDA_PIN, I2C_SCL_PIN))
+    {
+        SerialMon.println("PMU init failed (AXP2101 not found). Check I2C wiring.");
+        return false;
+    }
+
+    // Power rails per LilyGo guidance
+    pmu.disableDC3();
+    delay(200);
+    pmu.setDC3Voltage(3000);
+    pmu.enableDC3();
+    pmu.setBLDO2Voltage(3300);
+    pmu.enableBLDO2();
+
+    pmu.disableTSPinMeasure();
+    pmu.enableBattVoltageMeasure();
+    pmu.enableVbusVoltageMeasure();
+    pmu.enableSystemVoltageMeasure();
+
+    SerialMon.printf("PMU rails: DC3=%s (%u mV), BLDO2=%s (%u mV)\n",
+                     pmu.isEnableDC3() ? "ON" : "OFF", pmu.getDC3Voltage(),
+                     pmu.isEnableBLDO2() ? "ON" : "OFF", pmu.getBLDO2Voltage());
+    return true;
+}
+
+void powerPulseModem()
+{
+    pinMode(MODEM_PWRKEY_PIN, OUTPUT);
+    pinMode(MODEM_DTR_PIN, OUTPUT);
+    pinMode(MODEM_RI_PIN, INPUT);
+    digitalWrite(MODEM_DTR_PIN, LOW);
+    digitalWrite(MODEM_PWRKEY_PIN, LOW);
+    delay(100);
+    digitalWrite(MODEM_PWRKEY_PIN, HIGH);
+    delay(1000);
+    digitalWrite(MODEM_PWRKEY_PIN, LOW);
+}
+
+bool waitForModem()
+{
+    int retry = 0;
+    while (!modem.testAT(AT_WAIT_MS))
+    {
+        SerialMon.print(".");
+        if (++retry >= AT_RETRY_LIMIT)
+        {
+            SerialMon.println("\nAT timeout. UART/modem power issue?");
+            return false;
+        }
+        if (retry % 5 == 0)
+        {
+            SerialMon.println("\nRetrying modem power pulse...");
+            powerPulseModem();
+        }
+        delay(500);
+    }
+    SerialMon.println("\nAT response OK");
+    return true;
+}
+
+bool checkSimReady()
+{
+    SerialMon.println("Checking SIM (CPIN)...");
+    const unsigned long start = millis();
+
+    while (millis() - start < 60000UL)
+    {
+        modem.sendAT("+CPIN?");
+        int8_t r = modem.waitResponse(2000, "READY", "SIM PIN", "NOT INSERTED");
+
+        if (r == 1)
+        {
+            SerialMon.println("CPIN: READY");
+            return true;
+        }
+        if (r == 2)
+        {
+            logHint("CPIN: SIM PIN (SIM is locked). Unlock SIM or disable PIN.");
+            return false;
+        }
+        if (r == 3)
+        {
+            logHint("CPIN: NOT INSERTED (SIM not detected). Reseat SIM.");
+            return false;
+        }
+
+        SerialMon.println("CPIN not ready yet... retrying");
+        delay(2000);
+    }
+
+    logHint("CPIN check timed out. Modem/SIM init still not ready.");
+    return false;
+}
+
+void printSignalAndReg()
+{
+    int16_t csq = modem.getSignalQuality();
+    SerialMon.printf("CSQ: %d\n", csq);
+
+    String resp;
+    modem.sendAT("+CEREG?");
+    modem.waitResponse(2000, resp);
+    SerialMon.print("AT+CEREG?: ");
+    SerialMon.println(resp);
+
+    resp = "";
+    modem.sendAT("+CREG?");
+    modem.waitResponse(2000, resp);
+    SerialMon.print("AT+CREG?: ");
+    SerialMon.println(resp);
+
+    resp = "";
+    modem.sendAT("+COPS?");
+    modem.waitResponse(2000, resp);
+    SerialMon.print("Operator: ");
+    SerialMon.println(resp);
+}
+
+int readRegStatus()
+{
+    String resp;
+    modem.sendAT("+CEREG?");
+    modem.waitResponse(2000, resp);
+    int stat = -1;
+    int mode = 0;
+    if (sscanf(resp.c_str(), "+CEREG: %d,%d", &mode, &stat) == 2)
+    {
+        return stat;
+    }
+    resp = "";
+    modem.sendAT("+CREG?");
+    modem.waitResponse(2000, resp);
+    if (sscanf(resp.c_str(), "+CREG: %d,%d", &mode, &stat) == 2)
+    {
+        return stat;
+    }
+    return -1;
+}
+
+bool waitForRegistration()
+{
+    SerialMon.println("Waiting for network registration (CEREG)...");
+    const unsigned long start = millis();
+
+    while (millis() - start < REGISTRATION_TIMEOUT)
+    {
+        modem.sendAT("+CEREG?");
+        int8_t r = modem.waitResponse(3000, "+CEREG: 0,1", "+CEREG: 0,5");
+
+        int16_t csq = modem.getSignalQuality();
+        SerialMon.printf("Reg check: %s  CSQ: %d\n",
+                         (r == 1) ? "HOME" : (r == 2) ? "ROAM" : "NOT YET",
+                         csq);
+
+        if (r == 1 || r == 2)
+        {
+            SerialMon.println("Network registration OK");
+            return true;
+        }
+
+        delay(3000);
+    }
+
+    logHint("Registration timeout. Check antenna/SIM/coverage.");
+    return false;
+}
+
+void ensureGnssOff()
+{
+    modem.disableGPS();
+    modem.sendAT("+CGNSPWR=0");
+    modem.waitResponse(2000);
+    pmu.disableBLDO2();
+}
+
+int getCgattState()
+{
+    String resp;
+    modem.sendAT("+CGATT?");
+    int8_t r = modem.waitResponse(5000, resp);
+    SerialMon.print("AT+CGATT?: ");
+    SerialMon.println(resp);
+    if (r != 1)
+    {
+        return -1;
+    }
+    int state = -1;
+    int idx = resp.indexOf("+CGATT:");
+    if (idx >= 0)
+    {
+        if (sscanf(resp.substring(idx).c_str(), "+CGATT: %d", &state) != 1)
+        {
+            state = -1;
+        }
+    }
+    return state;
+}
+
+bool waitForCgattState(int target, uint32_t timeoutMs)
+{
+    unsigned long start = millis();
+    while (millis() - start < timeoutMs)
+    {
+        int state = getCgattState();
+        if (state == target)
+        {
+            return true;
+        }
+        delay(1000);
+    }
+    return false;
+}
+
+bool parseCNACTForCid(const String &resp, int targetCid, bool &cidActive, String &ip)
+{
+    cidActive = false;
+    ip = "0.0.0.0";
+    int search = 0;
+    while (true)
+    {
+        int idx = resp.indexOf("+CNACT:", search);
+        if (idx < 0)
+        {
+            break;
+        }
+        int lineEnd = resp.indexOf('\n', idx);
+        String line = lineEnd >= 0 ? resp.substring(idx, lineEnd) : resp.substring(idx);
+        int cid = 0, state = 0;
+        char ipBuf[32] = {0};
+        if (sscanf(line.c_str(), "+CNACT: %d,%d,\"%31[^\"]\"", &cid, &state, ipBuf) == 3 ||
+            sscanf(line.c_str(), "+CNACT: %d,%d,%31s", &cid, &state, ipBuf) == 3)
+        {
+            if (cid == targetCid)
+            {
+                cidActive = (state == 1);
+                ip = String(ipBuf);
+                return true;
+            }
+        }
+        else if (sscanf(line.c_str(), "+CNACT: %d,%d", &cid, &state) == 2)
+        {
+            if (cid == targetCid)
+            {
+                cidActive = (state == 1);
+                ip = "0.0.0.0";
+                return true;
+            }
+        }
+        search = idx + 1;
+    }
+    return false;
+}
+
+bool queryCNACTStatus(int cid, bool &cidActive, String &ip)
+{
+    String resp;
+    modem.sendAT("+CNACT?");
+    modem.waitResponse(5000, resp);
+    SerialMon.print("AT+CNACT?: ");
+    SerialMon.println(resp);
+    return parseCNACTForCid(resp, cid, cidActive, ip);
+}
+
+bool setApnCid0()
+{
+    String resp;
+
+    String cmd = String("+CGDCONT=1,\"IP\",\"") + APN + "\"";
+    SerialMon.print("AT");
+    SerialMon.println(cmd);
+
+    modem.sendAT(cmd);
+    int8_t r = modem.waitResponse(5000, resp);
+
+    SerialMon.print("CGDCONT resp: ");
+    SerialMon.println(resp);
+
+    if (r != 1)
+    {
+        SerialMon.println("Failed to set CGDCONT(1) APN.");
+        return false;
+    }
+
+    SerialMon.println("CGDCONT(1) set OK.");
+    return true;
+}
+
+bool activateCid0(String &ipOut)
+{
+    ipOut = "";
+
+    SerialMon.println("AT+CGATT=1");
+    modem.sendAT("+CGATT=1");
+    if (modem.waitResponse(15000) != 1)
+    {
+        SerialMon.println("CGATT=1 failed");
+        return false;
+    }
+
+    SerialMon.println("AT+CNACT=0,1");
+    modem.sendAT("+CNACT=0,1");
+    if (modem.waitResponse(20000) != 1)
+    {
+        SerialMon.println("CNACT=0,1 failed");
+        return false;
+    }
+
+    String resp;
+    modem.sendAT("+CNACT?");
+    modem.waitResponse(5000, resp);
+
+    SerialMon.print("CNACT?: ");
+    SerialMon.println(resp);
+
+    int cid = -1;
+    int state = 0;
+    char ip[32] = {0};
+
+    if (sscanf(resp.c_str(), "+CNACT: %d,%d,\"%31[^\"]\"", &cid, &state, ip) >= 2)
+    {
+        if (cid == 0 && state == 1 && strlen(ip) > 0)
+        {
+            ipOut = ip;
+            SerialMon.print("CID0 active. IP: ");
+            SerialMon.println(ipOut);
+            return true;
+        }
+    }
+
+    int idx = resp.indexOf("+CNACT: 0,1,");
+    if (idx >= 0)
+    {
+        int q1 = resp.indexOf('"', idx);
+        int q2 = resp.indexOf('"', q1 + 1);
+        if (q1 >= 0 && q2 > q1)
+        {
+            ipOut = resp.substring(q1 + 1, q2);
+            SerialMon.print("CID0 active. IP: ");
+            SerialMon.println(ipOut);
+            return true;
+        }
+    }
+
+    SerialMon.println("CID0 not active after CNACT. Check CNACT output above.");
+    return false;
+}
+
+void deactivateCid0()
+{
+    SerialMon.println("Deactivating CID0 / detaching...");
+    modem.sendAT("+CNACT=0,0");
+    modem.waitResponse(10000);
+
+    modem.sendAT("+CGATT=0");
+    modem.waitResponse(5000);
+    waitForCgattState(0, 10000);
+
+    bool cidActive = false;
+    String ip;
+    queryCNACTStatus(0, cidActive, ip);
+
+    SerialMon.printf("CID0 state after deactivate: %s, IP: %s\n",
+                     cidActive ? "active" : "inactive",
+                     ip.c_str());
+    int state = getCgattState();
+    SerialMon.printf("CGATT after deactivate: %d\n", state);
+}
+
+bool dnsCheck(const char *host)
+{
+    String resp;
+    modem.sendAT("+CDNSGIP=\"", host, "\"");
+    modem.waitResponse(10000, resp);
+    SerialMon.print("DNS response: ");
+    SerialMon.println(resp);
+
+    bool ok = resp.indexOf("+CDNSGIP:") >= 0 && resp.indexOf("ERROR") < 0;
+    SerialMon.println(ok ? "DNS ok" : "DNS failed");
+    return ok;
+}
+
+bool pingCheck()
+{
+    String resp;
+    modem.sendAT("+SNPING4=\"8.8.8.8\",1,16,1000");
+    modem.waitResponse(10000, resp);
+    SerialMon.print("Ping response: ");
+    SerialMon.println(resp);
+
+    bool ok = resp.indexOf("+SNPING4:") >= 0 && resp.indexOf("timeout") < 0 && resp.indexOf("ERROR") < 0;
+    SerialMon.println(ok ? "Ping ok" : "Ping failed");
+    return ok;
+}
+
+bool tlsConnectTest(const char *host, uint16_t port)
+{
+    SerialMon.printf("TLS test connect to %s:%u...\n", host, port);
+    bool ok = tlsClient.connect(host, port);
+    SerialMon.println(ok ? "TLS connect ok" : "TLS connect failed");
+    tlsClient.stop();
+    return ok;
+}
+
+void runCellularCycle()
+{
+    printModeHeader("Cellular mode", ANSI_GREEN);
+
+    ensureGnssOff();
+    modem.sendAT("+CFUN=1");
+    modem.waitResponse(5000);
+
+    printSignalAndReg();
+
+    if (!checkSimReady())
+        return;
+
+    // Prefer Cat-M, fallback to NB-IoT
+    modem.sendAT("+CNMP=38");
+    modem.waitResponse(3000);
+    modem.sendAT("+CMNB=1");
+    modem.waitResponse(3000);
+
+    modem.sendAT("+COPS=0");
+    modem.waitResponse(10000);
+
+    if (!waitForRegistration())
+    {
+        // try NB-IoT
+        modem.sendAT("+CNMP=38");
+        modem.waitResponse(3000);
+        modem.sendAT("+CMNB=2");
+        modem.waitResponse(3000);
+        if (!waitForRegistration())
+            return;
+    }
+
+    setLed(LedState::Registered);
+    printSignalAndReg();
+
+    if (!modem.isGprsConnected())
+    {
+        SerialMon.println("Connecting APN...");
+        if (!modem.gprsConnect(APN, "", ""))
+        {
+            logHint("APN attach failed.");
+            setLed(LedState::Fail);
+            return;
+        }
+    }
+
+    if (lastFix.hasFix)
+    {
+        sendIngestIfReady();
+    }
+    else
+    {
+        SerialMon.println("Skipping upload: no GNSS fix captured.");
+    }
+
+    delay(PDP_ACTIVE_MS);
+    modem.gprsDisconnect();
+}
+
+void runGnssCycle()
+{
+    printModeHeader("GNSS mode", ANSI_CYAN);
+
+    deactivateCid0();
+    ensureGnssOff();
+
+    modem.sendAT("+CFUN=0");
+    modem.waitResponse(3000);
+
+    pmu.enableBLDO2();
+    if (!modem.enableGPS())
+    {
+        logHint("Failed to enable GNSS.");
+        return;
+    }
+
+    SerialMon.println("GNSS on. Waiting for fix...");
+    unsigned long start = millis();
+    float lat = 0, lon = 0, speed = 0, alt = 0, hdop = 0;
+    int vsat = 0, usat = 0;
+    int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
+
+    while (millis() - start < GNSS_FIX_TIMEOUT_MS)
+    {
+        if (modem.getGPS(&lat, &lon, &speed, &alt, &vsat, &usat, &hdop,
+                         &year, &month, &day, &hour, &minute, &second))
+        {
+            SerialMon.println("GNSS fix acquired:");
+            SerialMon.printf("  Lat: %.6f\n", lat);
+            SerialMon.printf("  Lon: %.6f\n", lon);
+            SerialMon.printf("  Alt: %.2f m (%.2f ft)\n", alt, alt * 3.28084);
+            SerialMon.printf("  Speed: %.2f kn (%.2f mph)\n", speed, speed * 1.15078);
+            SerialMon.printf("  Sats(v/u): %d/%d\n", vsat, usat);
+            SerialMon.printf("  HDOP/acc: %.2f\n", hdop);
+            SerialMon.printf("  UTC: %04d-%02d-%02d %02d:%02d:%02d\n",
+                             year, month, day, hour, minute, second);
+
+            lastFix.hasFix = true;
+            lastFix.lat = lat;
+            lastFix.lon = lon;
+            lastFix.hdop = hdop;
+            lastFix.sats = usat;
+            lastFix.tsMs = toEpochMs(year, month, day, hour, minute, second);
+
+            double dist = distanceMeters(lat, lon, HOME_LAT, HOME_LON);
+            TrackerMode newMode = TrackerMode::Home;
+            if (dist > NEARBY_RADIUS_M)
+            {
+                newMode = TrackerMode::Roaming;
+            }
+            else if (dist > HOME_RADIUS_M)
+            {
+                newMode = TrackerMode::Nearby;
+            }
+            currentMode = newMode;
+            SerialMon.printf("Mode set to %s (dist %.1f m)\n",
+                             currentMode == TrackerMode::Home   ? "Home"
+                             : currentMode == TrackerMode::Nearby ? "Nearby"
+                                                                   : "Roaming",
+                             dist);
+            break;
+        }
+        SerialMon.println("No fix yet...");
+        delay(2000);
+    }
+
+    modem.disableGPS();
+    modem.sendAT("+CGNSPWR=0");
+    modem.waitResponse(2000);
+    pmu.disableBLDO2();
+    SerialMon.println("GNSS off.");
+}
+
+void setup()
+{
+    pinMode(LED_BUILTIN, OUTPUT);
+    digitalWrite(LED_BUILTIN, LOW);
+
+    SerialMon.begin(115200);
+    unsigned long waitStart = millis();
+    while (!SerialMon && millis() - waitStart < 3000)
+    {
+        delay(10);
+    }
+    SerialMon.println("\nBOOT: Tyee tracker starting...");
+    delay(200);
+
+    printPins();
+
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    if (!initPMU())
+    {
+        logHint("PMU init failed. Holding.");
+        while (true)
+            delay(1000);
+    }
+
+    SerialMon.println("Bringing up modem UART...");
+    SerialAT.begin(MODEM_BAUD, SERIAL_8N1, MODEM_SERIAL_RX, MODEM_SERIAL_TX);
+    powerPulseModem();
+
+    if (!waitForModem())
+    {
+        logHint("Modem did not respond to AT. Check UART pins or power rails.");
+    }
+
+    nextGnssAt = millis();
+}
+
+void loop()
+{
+    unsigned long now = millis();
+    if (now < nextGnssAt)
+    {
+        delay(100);
+        return;
+    }
+
+    runGnssCycle();
+
+    if (wifiPreferred && WiFi.status() == WL_CONNECTED)
+    {
+        SerialMon.println("WiFi connected, sending via WiFi only.");
+        sendIngestWiFi();
+        nextGnssAt = millis() + HOME_INTERVAL_MS;
+        return;
+    }
+
+    if (currentMode == TrackerMode::Home)
+    {
+        runCellularCycle();
+        nextGnssAt = millis() + HOME_INTERVAL_MS;
+    }
+    else
+    {
+        runCellularCycle();
+        nextGnssAt = millis() + (currentMode == TrackerMode::Nearby ? NEARBY_INTERVAL_MS : ROAM_INTERVAL_MS);
+    }
+}

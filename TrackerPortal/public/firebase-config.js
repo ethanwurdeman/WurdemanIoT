@@ -14,5 +14,7 @@ export const ingestConfig = {
   url: "https://us-central1-wurdemaniot.cloudfunctions.net/tyee_ingest",
   deviceId: "Tyee",
   deviceToken: "b7c9e2a41fd64e7d9f13c8a5",
-  thermostatId: "home"
+  thermostatId: "home",
+  googleMapsApiKey: "AIzaSyAedETIC9Rf4PzFQHG6d9rpATfDUGyyGU4",
+  googleMapsLibraries: "drawing"
 };

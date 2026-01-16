@@ -8,6 +8,7 @@ const { Timestamp, FieldValue } = admin.firestore;
 
 const TYEE_TOKEN = () => process.env.TYEE_TOKEN || "";
 const THERMOSTAT_TOKEN = () => process.env.THERMOSTAT_TOKEN || "";
+const DOGHOUSE_TOKEN = () => process.env.DOGHOUSE_TOKEN || "";
 const WU_STATION_ID = () => process.env.WU_STATION_ID || "";
 const WU_API_KEY = () => process.env.WU_API_KEY || "";
 const DEFAULT_THERMOSTAT_CONFIG = {
@@ -295,6 +296,7 @@ interface OutsideReading {
   windMph: number | null;
   windGustMph: number | null;
   precipIn: number | null;
+  pressureIn?: number | null;
 }
 
 interface ThermostatConfigShape {
@@ -463,6 +465,196 @@ export const thermostatConfig = onRequest(
         res.status(500).json({ error: "Failed to update thermostat config" });
         return;
       }
+    }
+
+    res.set("Allow", "GET, POST");
+    res.status(405).json({ error: "Method not allowed" });
+  }
+);
+
+// --- Dog House (simplified scaffold) ---
+interface DoghouseStatus {
+  ts: admin.firestore.Timestamp;
+  tempF: number | null;
+  humidity: number | null;
+  heatIndexF: number | null;
+  doorOpen: boolean;
+  doorLastOpen: admin.firestore.Timestamp | null;
+  doorLastClose: admin.firestore.Timestamp | null;
+  fanOn: boolean;
+  heaterOn: boolean;
+  emergencyOpen: boolean;
+  waterOk: boolean | null;
+  waterFault: boolean | null;
+}
+
+interface DoghouseConfigShape {
+  emergencyTempF: number;
+  emergencyFeelF: number;
+  fanOnFeelF: number;
+  heaterOnFeelF: number;
+  feedCycleSec: number;
+  waterCycleSec: number;
+  waterMaxRunSec: number;
+}
+
+const DEFAULT_DOGHOUSE_CONFIG: DoghouseConfigShape = {
+  emergencyTempF: 200,
+  emergencyFeelF: 100,
+  fanOnFeelF: 80,
+  heaterOnFeelF: 50,
+  feedCycleSec: 5,
+  waterCycleSec: 10,
+  waterMaxRunSec: 60
+};
+
+function normalizeDoghouseStatus(body: Record<string, unknown>): DoghouseStatus {
+  let ts = parseTimestamp(body.ts);
+  if (!ts || !isSaneTimestamp(ts)) {
+    ts = Timestamp.fromMillis(Date.now());
+  }
+  return {
+    ts,
+    tempF: toNullableNumber(body.tempF),
+    humidity: toNullableNumber(body.humidity),
+    heatIndexF: toNullableNumber(body.heatIndexF),
+    doorOpen: toBoolean(body.doorOpen, false),
+    doorLastOpen: parseTimestamp((body as { doorLastOpen?: unknown }).doorLastOpen) ?? null,
+    doorLastClose: parseTimestamp((body as { doorLastClose?: unknown }).doorLastClose) ?? null,
+    fanOn: toBoolean(body.fanOn, false),
+    heaterOn: toBoolean(body.heaterOn, false),
+    emergencyOpen: toBoolean((body as { emergencyOpen?: unknown }).emergencyOpen, false),
+    waterOk: toNullableNumber((body as { waterOk?: unknown }).waterOk) != null
+      ? toBoolean((body as { waterOk?: unknown }).waterOk, false)
+      : null,
+    waterFault: toNullableNumber((body as { waterFault?: unknown }).waterFault) != null
+      ? toBoolean((body as { waterFault?: unknown }).waterFault, false)
+      : null
+  };
+}
+
+function normalizeDoghouseConfig(input: unknown, fallback?: DoghouseConfigShape): DoghouseConfigShape {
+  const base = fallback || DEFAULT_DOGHOUSE_CONFIG;
+  const cfg = (input || {}) as Record<string, unknown>;
+  return {
+    emergencyTempF: toNumber(cfg.emergencyTempF, base.emergencyTempF),
+    emergencyFeelF: toNumber(cfg.emergencyFeelF, base.emergencyFeelF),
+    fanOnFeelF: toNumber(cfg.fanOnFeelF, base.fanOnFeelF),
+    heaterOnFeelF: toNumber(cfg.heaterOnFeelF, base.heaterOnFeelF),
+    feedCycleSec: toNumber(cfg.feedCycleSec, base.feedCycleSec),
+    waterCycleSec: toNumber(cfg.waterCycleSec, base.waterCycleSec),
+    waterMaxRunSec: toNumber(cfg.waterMaxRunSec, base.waterMaxRunSec)
+  };
+}
+
+export const doghouseIngest = onRequest(
+  { cors: true, region: "us-central1", concurrency: 8 },
+  async (req, res) => {
+    res.set("Access-Control-Allow-Origin", "*");
+    res.set("Access-Control-Allow-Headers", "Content-Type, X-Device-Token, X-Device-Id");
+
+    if (req.method === "OPTIONS") {
+      res.status(204).send("");
+      return;
+    }
+    if (req.method !== "POST") {
+      res.set("Allow", "POST");
+      res.status(405).json({ error: "Method not allowed" });
+      return;
+    }
+
+    const token = (req.get("X-Device-Token") || req.get("x-device-token") || "").trim();
+    if (!DOGHOUSE_TOKEN() || !token || token !== DOGHOUSE_TOKEN()) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const deviceId = ((body.deviceId as string) || "main").trim();
+    if (!deviceId) {
+      res.status(400).json({ error: "Missing deviceId" });
+      return;
+    }
+
+    const status = normalizeDoghouseStatus(body);
+
+    try {
+      const ref = db.collection("doghouse").doc(deviceId);
+      const batch = db.batch();
+      batch.set(
+        ref,
+        {
+          updatedAt: FieldValue.serverTimestamp(),
+          status,
+          name: (body.name as string) ?? deviceId
+        },
+        { merge: true }
+      );
+      const histId = String(status.ts.toMillis());
+      batch.set(ref.collection("history").doc(histId), {
+        ts: status.ts,
+        tempF: status.tempF,
+        humidity: status.humidity,
+        heatIndexF: status.heatIndexF,
+        doorOpen: status.doorOpen
+      });
+      await batch.commit();
+      res.status(200).json({ status: "ok", deviceId });
+    } catch (err) {
+      logger.error("Doghouse ingest failure", err as Error);
+      res.status(500).json({ error: "Failed to ingest" });
+    }
+  }
+);
+
+export const doghouseConfig = onRequest(
+  { cors: true, region: "us-central1" },
+  async (req, res) => {
+    res.set("Access-Control-Allow-Origin", "*");
+    res.set("Access-Control-Allow-Headers", "Content-Type, X-Device-Token, X-Device-Id");
+    if (req.method === "OPTIONS") {
+      res.status(204).send("");
+      return;
+    }
+
+    const token = (req.get("X-Device-Token") || req.get("x-device-token") || "").trim();
+    if (!DOGHOUSE_TOKEN() || !token || token !== DOGHOUSE_TOKEN()) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    const deviceId = ((req.method === "GET" ? (req.query.deviceId as string) : (req.body?.deviceId as string)) || "main").trim();
+    if (!deviceId) {
+      res.status(400).json({ error: "Missing deviceId" });
+      return;
+    }
+
+    if (req.method === "GET") {
+      try {
+        const ref = db.collection("doghouse").doc(deviceId);
+        const snap = await ref.get();
+        const cfg = normalizeDoghouseConfig(snap.data()?.config);
+        res.status(200).json({ deviceId, config: cfg, serverTime: Date.now() });
+      } catch (err) {
+        logger.error("Doghouse config fetch failed", err as Error);
+        res.status(500).json({ error: "Failed to load config" });
+      }
+      return;
+    }
+
+    if (req.method === "POST") {
+      try {
+        const ref = db.collection("doghouse").doc(deviceId);
+        const snap = await ref.get();
+        const existing = snap.exists ? snap.data() : undefined;
+        const merged = normalizeDoghouseConfig(req.body?.config, existing?.config as DoghouseConfigShape | undefined);
+        await ref.set({ config: merged, configUpdatedAt: FieldValue.serverTimestamp() }, { merge: true });
+        res.status(200).json({ status: "ok", deviceId });
+      } catch (err) {
+        logger.error("Doghouse config update failed", err as Error);
+        res.status(500).json({ error: "Failed to update config" });
+      }
+      return;
     }
 
     res.set("Allow", "GET, POST");
@@ -756,6 +948,7 @@ async function fetchAndStoreOutside(deviceId: string) {
           windSpeed?: number;
           windGust?: number;
           precipRate?: number;
+          pressure?: number;
         };
       }>;
     };
@@ -770,7 +963,8 @@ async function fetchAndStoreOutside(deviceId: string) {
       humidity: toNullableNumber(imperial.humidity ?? obs.humidity),
       windMph: toNullableNumber(imperial.windSpeed),
       windGustMph: toNullableNumber(imperial.windGust),
-      precipIn: toNullableNumber(imperial.precipRate)
+      precipIn: toNullableNumber(imperial.precipRate),
+      pressureIn: toNullableNumber(imperial.pressure)
     };
     const ref = db.collection("thermostats").doc(deviceId);
     const outsideColl = ref.collection("outside").doc(String(ts.toMillis()));

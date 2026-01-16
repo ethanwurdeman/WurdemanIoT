@@ -38,3 +38,13 @@
 #define CELL_APN "hologram"
 #define CELL_APN_USER ""
 #define CELL_APN_PASS ""
+
+// --- Dog House (ESP32) ---
+#define DOGHOUSE_DEVICE_ID "doghouse"
+#define DOGHOUSE_DEVICE_TOKEN "e6f9d4c1a7b84fb19c5d3b2f7a4c8e9d"  // set same in Cloud Run env DOGHOUSE_TOKEN (non-secret)
+#define DOGHOUSE_INGEST_URL "https://us-central1-wurdemaniot.cloudfunctions.net/doghouseIngest"
+#define DOGHOUSE_CONFIG_URL "https://us-central1-wurdemaniot.cloudfunctions.net/doghouseConfig"
+#define DOGHOUSE_EMERGENCY_TEMP_F 200.0
+#define DOGHOUSE_EMERGENCY_FEEL_F 100.0
+#define DOGHOUSE_FAN_ON_FEEL_F 80.0
+#define DOGHOUSE_HEATER_ON_FEEL_F 50.0
