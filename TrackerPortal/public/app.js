@@ -1921,6 +1921,7 @@ function renderDog(deviceId, label = "Dog") {
       <div class="section-header">
         <h3>Timeline (today)</h3>
         <div class="history-meta" id="timeline-label">00:00 - 23:59</div>
+        <button class="btn ghost" type="button" id="timeline-clear-btn">Clear</button>
       </div>
       <div class="timeline-container">
         <canvas id="timeline-canvas" width="900" height="120"></canvas>
@@ -2098,6 +2099,7 @@ function setupTimelineCanvas(deviceId) {
   const canvas = document.getElementById("timeline-canvas");
   const hoverEl = document.getElementById("timeline-hover");
   const labelEl = document.getElementById("timeline-label");
+  const clearBtn = document.getElementById("timeline-clear-btn");
   const prevBtn = document.getElementById("day-prev-btn");
   const nextBtn = document.getElementById("day-next-btn");
 
@@ -2110,6 +2112,18 @@ function setupTimelineCanvas(deviceId) {
       updateDayLabel();
       if (labelEl) labelEl.textContent = `${formatMinutes(0)} - ${formatMinutes(1440)}`;
       loadHistory(deviceId, state.selectedDay);
+    };
+  }
+
+  if (clearBtn) {
+    clearBtn.onclick = () => {
+      state.timelineStartMin = 0;
+      state.timelineEndMin = 1440;
+      state.timelineHoverTs = null;
+      if (labelEl) labelEl.textContent = `${formatMinutes(0)} - ${formatMinutes(1440)}`;
+      if (hoverEl) hoverEl.textContent = "Hover to see time.";
+      renderTimelineSlice();
+      drawTimeline(state.historyPoints);
     };
   }
   if (nextBtn) {
@@ -2700,7 +2714,9 @@ function drawHistory(points) {
     });
     marker.addListener("mouseover", () => {
       const speed = p.speedMph != null ? `${Number(p.speedMph).toFixed(1)} mph` : "-";
-      state.mapInfoWindow.setContent(`${formatTimeOfDay(p.ts)}<br/>Speed: ${speed}`);
+      state.mapInfoWindow.setContent(
+        `<div class="map-info-window"><div class="map-info-title">${formatTimeOfDay(p.ts)}</div><div class="map-info-sub">Speed: ${speed}</div></div>`
+      );
       state.mapInfoWindow.open({ map: state.map, anchor: marker });
     });
     state.historyMarkers.push(marker);
@@ -2739,7 +2755,9 @@ function highlightNearestPoint(tsMs) {
   state.hoverMarker.setPosition({ lat: best.lat, lng: best.lon });
   const speed = best.speedMph != null ? `${Number(best.speedMph).toFixed(1)} mph` : "-";
   if (!state.mapInfoWindow) state.mapInfoWindow = new maps.InfoWindow();
-  state.mapInfoWindow.setContent(`${formatTimeOfDay(best.ts)}<br/>Speed: ${speed}`);
+  state.mapInfoWindow.setContent(
+    `<div class="map-info-window"><div class="map-info-title">${formatTimeOfDay(best.ts)}</div><div class="map-info-sub">Speed: ${speed}</div></div>`
+  );
   state.mapInfoWindow.open({ map: state.map, anchor: state.hoverMarker });
 }
 

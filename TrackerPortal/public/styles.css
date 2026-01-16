@@ -359,12 +359,30 @@ a {
   width: 100%;
 }
 
+.timeline-container .btn {
+  align-self: flex-start;
+}
+
 .timeline-container canvas {
   width: 100%;
   border: 1px solid rgba(148, 163, 184, 0.3);
   border-radius: 12px;
   background: rgba(255, 255, 255, 0.02);
   box-shadow: var(--shadow);
+}
+
+.map-info-window {
+  color: #0f172a;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 6px 10px;
+}
+.map-info-window .map-info-title {
+  margin-bottom: 4px;
+}
+.map-info-window .map-info-sub {
+  color: #475569;
+  font-weight: 400;
 }
 
 .day-nav {
